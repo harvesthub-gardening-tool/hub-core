@@ -1,0 +1,20 @@
+[package]
+name = "harvesthub-esp32"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# HAL 1.0 for classic ESP32 (Xtensa) — no embassy features here
+esp-hal = { version = "1.0.0", features = ["esp32", "unstable", "requires-unstable"] }
+
+# RTOS + Embassy glue (executor + time driver)
+esp-rtos = { version = "0.2", features = ["esp32", "embassy"] }
+
+# Embassy runtime & time (no arch-* features on executor)
+embassy-executor = "0.9.1"
+embassy-time = "0.5.0"
+static_cell = "2"
+
+# Logging / panic (current series)
+esp-println = { version = "0.16.1", default-features = false, features = ["esp32", "uart"] }
+esp-backtrace = { version = "0.18", features = ["esp32", "panic-handler", "println"] }
