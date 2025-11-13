@@ -1,20 +1,46 @@
 [package]
-name = "harvesthub-esp32"
+name = "hub-core"
 version = "0.1.0"
 edition = "2021"
+authors = ["Maxime THEVENEAU <maxime.theveneau@epitech.eu>"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
-# HAL 1.0 for classic ESP32 (Xtensa) — no embassy features here
-esp-hal = { version = "1.0.0", features = ["esp32", "unstable", "requires-unstable"] }
+# Shared dependency (PC + ESP)
+log = "0.4.28"
 
-# RTOS + Embassy glue (executor + time driver)
-esp-rtos = { version = "0.2", features = ["esp32", "embassy"] }
+# --- ESP32-specific deps: only used when building for xtensa-esp32-none-elf ---
 
-# Embassy runtime & time (no arch-* features on executor)
+[target.xtensa-esp32-none-elf.dependencies]
+esp-hal = { version = "1.0.0", features = ["esp32", "unstable"] }
+esp-println = { version = "0.16.1", features = ["esp32", "log-04"] }
+esp-rtos = { version = "0.2.0", features = ["esp32", "embassy", "log-04"] }
+esp-sync = { version = "0.1.1", features = ["esp32"] }
+esp-rom-sys = { version = "0.1.3", features = ["esp32"] }
+
 embassy-executor = "0.9.1"
-embassy-time = "0.5.0"
-static_cell = "2"
+embassy-time     = "0.5.0"
 
-# Logging / panic (current series)
-esp-println = { version = "0.16.1", default-features = false, features = ["esp32", "uart"] }
-esp-backtrace = { version = "0.18", features = ["esp32", "panic-handler", "println"] }
+[profile.dev]
+opt-level = "s"
+panic = "abort"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = false
+panic = "abort"
+
+# --- Binaries ---
+
+[[bin]]
+name = "hub-core-host"
+path = "src/main.rs"
+
+[[bin]]
+name = "hub-core-fw"
+path = "src/bin/firmware.rs"
