@@ -17,10 +17,7 @@ mod fw {
     use embassy_executor::Spawner;
     use embassy_time::{Duration, Timer};
 
-    use esp_hal::{
-        clock::CpuClock,
-        timer::timg::TimerGroup,
-    };
+    use esp_hal::{clock::CpuClock, timer::timg::TimerGroup};
 
     use log::info;
 
