@@ -1,28 +1,16 @@
 # hub-core
 
-## 1. Localhost
+### Flash
+```
+cargo run --release --bin hub-core-fw -Z build-std=core,compiler_builtins
+```
 
+### Erase flash
 ```
-cargo run --bin hub-core-host
+espflash erase-flash --chip esp32s3
 ```
 
-## 2. Firmware
-
-- Build:
+### Connect to COM
 ```
-cargo build 
-    --bin hub-core-fw 
-    --target xtensa-esp32-none-elf 
-    --no-default-features 
-    --features firmware 
-    --profile dev
-```
-- Run:
-```
-cargo run
-    --bin hub-core-fw
-    --target xtensa-esp32-none-elf
-    --no-default-features
-    --features firmware
-    --profile dev
+espflash monitor -p COM8 --baud 115200
 ```

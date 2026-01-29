@@ -1,50 +1,24 @@
-#![cfg_attr(target_arch = "xtensa", no_std)]
-#![cfg_attr(target_arch = "xtensa", no_main)]
+#![no_std]
+#![no_main]
 
-#[cfg(target_arch = "xtensa")]
-use core::panic::PanicInfo;
+use esp_backtrace as _;
+use esp_hal::{clock::CpuClock, delay::Delay};
+use esp_println::println;
 
-// --- Panic handler seulement côté ESP (xtensa) ---
-#[cfg(target_arch = "xtensa")]
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+esp_bootloader_esp_idf::esp_app_desc!();
 
-// --- Firmware réel : seulement pour la cible xtensa-esp32-none-elf ---
-#[cfg(target_arch = "xtensa")]
-mod fw {
-    use embassy_executor::Spawner;
-    use embassy_time::{Duration, Timer};
+#[esp_hal::main]
+fn main() -> ! {
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let _peripherals = esp_hal::init(config);
 
-    use esp_hal::{clock::CpuClock, timer::timg::TimerGroup};
+    esp_println::logger::init_logger_from_env();
+    println!("BOOT OK: running firmware!");
 
-    use log::info;
-
-    #[esp_rtos::main]
-    async fn main(_spawner: Spawner) -> ! {
-        // Config CPU + init HAL
-        let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-        let peripherals = esp_hal::init(config);
-
-        // Timer matériel pour esp-rtos / embassy-time
-        let timg0 = TimerGroup::new(peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0);
-
-        // Logger via esp-println
-        esp_println::logger::init_logger_from_env();
-
-        loop {
-            let value = hub_core::core_logic();
-            info!("Hello from firmware (Embassy)! core_logic() = {value}");
-
-            // Sleep async 500 ms
-            Timer::after(Duration::from_millis(500)).await;
-        }
+    let d = Delay::new();
+    loop {
+        let value = hub_core::core_logic();
+        println!("Hello from ESP32-S3 firmware! core_logic() = {value}");
+        d.delay_millis(500u32);
     }
-}
-
-#[cfg(not(target_arch = "xtensa"))]
-fn main() {
-    // Ce binaire n’a pas vocation à tourner sur PC.
 }
