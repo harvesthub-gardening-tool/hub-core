@@ -2,7 +2,7 @@
 
 ### Flash
 ```
-cargo run --release --bin hub-core-fw --target xtensa-esp32s3-none-elf -Z build-std=core,compiler_builtins
+cargo run --release --bin hub-core-fw --target xtensa-esp32s3-none-elf -Z build-std=core,alloc,compiler_builtins
 ```
 
 ### Erase flash
