@@ -67,7 +67,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         BleConnector::new(radio, peripherals.BT, ble_cfg).expect("BleConnector::new() failed");
 
     // -------- Phase 1: scan & pick strongest (prints everything) --------
-    let picked = match hub_core::hci_scan_pick_strongest(&mut connector, Duration::from_secs(6)).await
+    let picked = match hub_core::hci_scan_pick_strongest_connectable(&mut connector, Duration::from_secs(6)).await
     {
         Some(p) => p,
         None => {

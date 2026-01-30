@@ -1,11 +1,10 @@
 #![no_std]
 
-use embassy_time::Duration;
+use embassy_time::{Duration, Instant, Timer};
 
 use bt_hci::param::BdAddr;
-use trouble_host::prelude::AddrKind;
-
 use embedded_io_async::{Read, Write};
+use trouble_host::prelude::AddrKind;
 
 /// Info we can collect from advertising before connecting.
 #[derive(Clone, Copy)]
@@ -13,6 +12,15 @@ pub struct Picked {
     pub kind: AddrKind,
     pub addr: BdAddr,
     pub rssi: i8,
+
+    /// True if advertiser says it is connectable (from event_type bit0).
+    pub connectable: bool,
+    /// True if advertiser is scannable (event_type bit1).
+    pub scannable: bool,
+    /// True if this report is a scan response (event_type bit3).
+    pub scan_response: bool,
+    /// True if legacy PDU (event_type bit4).
+    pub legacy: bool,
 
     pub flags: Option<u8>,
 
@@ -32,7 +40,7 @@ pub struct Picked {
 
 impl Picked {
     pub fn name_str(&self) -> Option<&str> {
-        let name = self.name.as_ref()?;
+        let name = self.name.as_ref()?; // Option<&[u8;32]>
         let n = self.name_len as usize;
         if n == 0 {
             return None;
@@ -128,11 +136,21 @@ async fn hci_read_packet<R: Read>(r: &mut R, buf: &mut [u8]) -> usize {
     }
 }
 
-/// Scan for `scan_time`, print every advertiser, and return the strongest RSSI device.
-/// Works by doing a small raw-HCI scan first, then you can pass the picked addr into Trouble.
+fn addr_kind_from_hci(addr_type: u8) -> AddrKind {
+    // HCI extended adv report "address type":
+    // 0 = public, 1 = random, others exist but these two are the common ones.
+    if addr_type == 0 {
+        AddrKind::PUBLIC
+    } else {
+        AddrKind::RANDOM
+    }
+}
+
+/// Scan for `scan_time`, print every advertiser, and return the strongest *connectable* device.
+/// This prevents the "Connecting… forever" problem when the strongest advertiser is not connectable.
 ///
 /// `connector` must implement embedded_io_async Read/Write (BleConnector does).
-pub async fn hci_scan_pick_strongest<C>(
+pub async fn hci_scan_pick_strongest_connectable<C>(
     connector: &mut C,
     scan_time: Duration,
 ) -> Option<Picked>
@@ -165,15 +183,15 @@ where
 
     esp_println::println!("Scanning {:?}… (printing all devices)", scan_time);
 
-    let t_end = embassy_time::Instant::now() + scan_time;
+    let t_end = Instant::now() + scan_time;
     let mut best: Option<Picked> = None;
 
     let mut buf = [0u8; 512];
 
-    while embassy_time::Instant::now() < t_end {
+    while Instant::now() < t_end {
         let n = hci_read_packet(connector, &mut buf).await;
         if n < 3 {
-            embassy_time::Timer::after(Duration::from_millis(10)).await;
+            Timer::after(Duration::from_millis(10)).await;
             continue;
         }
 
@@ -207,12 +225,21 @@ where
         idx += 1;
 
         for _ in 0..reports {
-            // minimal bounds check for fixed part
+            // Need at least the fixed header bytes
             if idx + 2 + 1 + 6 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 6 + 1 > params.len() {
                 break;
             }
 
-            idx += 2; // event_type
+            // event_type (u16 LE)
+            let event_type = u16::from_le_bytes([params[idx], params[idx + 1]]);
+            idx += 2;
+
+            let connectable = (event_type & 0x0001) != 0;
+            let scannable = (event_type & 0x0002) != 0;
+            let _directed = (event_type & 0x0004) != 0;
+            let scan_response = (event_type & 0x0008) != 0;
+            let legacy = (event_type & 0x0010) != 0;
+
             let addr_type = params[idx];
             idx += 1;
 
@@ -240,13 +267,17 @@ where
             let data = &params[idx..idx + data_len];
             idx += data_len;
 
-            let kind = if addr_type == 0 { AddrKind::PUBLIC } else { AddrKind::RANDOM };
+            let kind = addr_kind_from_hci(addr_type);
             let bd = BdAddr::new(addr);
 
             let mut p = Picked {
                 kind,
                 addr: bd,
                 rssi,
+                connectable,
+                scannable,
+                scan_response,
+                legacy,
                 flags: None,
                 name: None,
                 name_len: 0,
@@ -256,18 +287,27 @@ where
                 raw_adv: [0; 64],
                 raw_adv_len: 0,
             };
+
             parse_adv_fields(data, &mut p);
 
+            // Print everything we have (name only if present)
             if let Some(name) = p.name_str() {
                 esp_println::println!(
-                    "ADV: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} kind={:?} rssi={} name={}",
-                    addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], kind, rssi, name
+                    "ADV: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} kind={:?} rssi={} conn={} scan_rsp={} legacy={} name={}",
+                    addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+                    p.kind, p.rssi, p.connectable, p.scan_response, p.legacy, name
                 );
             } else {
                 esp_println::println!(
-                    "ADV: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} kind={:?} rssi={}",
-                    addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], kind, rssi
+                    "ADV: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} kind={:?} rssi={} conn={} scan_rsp={} legacy={}",
+                    addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+                    p.kind, p.rssi, p.connectable, p.scan_response, p.legacy
                 );
+            }
+
+            // Only pick connectable devices (fixes the infinite "Connecting…")
+            if !p.connectable {
+                continue;
             }
 
             match best {
