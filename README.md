@@ -14,3 +14,8 @@ espflash erase-flash --chip esp32s3
 ```
 espflash monitor --baud 115200
 ```
+
+### Format
+```
+cargo fmt
+```
