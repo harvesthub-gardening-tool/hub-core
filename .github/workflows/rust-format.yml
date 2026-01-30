@@ -8,9 +8,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Force stable toolchain (ignore esp)
+        run: rustup override set stable
+
       # Ensure rustfmt is installed and setup problem matcher
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt
+
       - name: Rustfmt Check
         uses: actions-rust-lang/rustfmt@v1
