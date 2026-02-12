@@ -13,6 +13,7 @@ use esp_println::{print, println};
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 
+use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Timer};
 use static_cell::StaticCell;
 
@@ -20,18 +21,22 @@ use bt_hci::controller::ExternalController;
 use esp_radio::ble::controller::BleConnector;
 
 use trouble_host::connection::{ConnectConfig, ConnectParams, PhySet, ScanConfig};
-use trouble_host::prelude::{HostResources, Runner};
+use trouble_host::prelude::{DefaultPacketPool, HostResources, Runner};
+use trouble_host::Host;
 
-use config::{ENVIRONMENTAL_SENSING_SERVICE_UUID16, TEMP_CHAR_UUID16, HUM_CHAR_UUID16, SCAN_WAIT_SECONDS};
 use crate::ble::helpers::uuid16_to_uuid128;
+use config::{
+    ENVIRONMENTAL_SENSING_SERVICE_UUID16, HUM_CHAR_UUID16, SCAN_WAIT_SECONDS, TEMP_CHAR_UUID16,
+};
 
 type MyController = ExternalController<BleConnector<'static>, 4>;
-type MyPacketPool = trouble_host::prelude::DefaultPacketPool;
+type MyPacketPool = DefaultPacketPool;
 type MyRunner = Runner<'static, MyController, MyPacketPool>;
 
 // choose something small but > number of services you’ll ever care about
 const MAX_GATT_SERVICES: usize = 8;
-type MyGattClient<'a> = trouble_host::gatt::GattClient<'a, MyController, MyPacketPool, MAX_GATT_SERVICES>;
+type MyGattClient<'a> =
+    trouble_host::gatt::GattClient<'a, MyController, MyPacketPool, MAX_GATT_SERVICES>;
 
 #[embassy_executor::task]
 async fn ble_runner_task(mut runner: MyRunner) {
@@ -106,7 +111,11 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         StaticCell::new();
     let stack = STACK.init(trouble_host::new(controller, resources));
 
-    let trouble_host::Host { mut central, runner, .. } = stack.build();
+    let Host {
+        mut central,
+        runner,
+        ..
+    } = stack.build();
     spawner.spawn(ble_runner_task(runner)).ok();
 
     // ------------------ Phase 3: loop forever (reconnect + read) ------------------
@@ -145,21 +154,48 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 Ok(conn) => {
                     println!("[HUB] Connected handle={:?}", conn.handle());
 
+                    println!("[GATT] Creating client...");
                     match MyGattClient::new(stack, &conn).await {
                         Ok(gatt) => {
+                            println!("[GATT] Client ready.");
 
-                            let svc = uuid16_to_uuid128(ENVIRONMENTAL_SENSING_SERVICE_UUID16);
-                            let char_list = &[
-                                uuid16_to_uuid128(TEMP_CHAR_UUID16),
-                                uuid16_to_uuid128(HUM_CHAR_UUID16),
-                            ];
+                            // IMPORTANT:
+                            // Drive gatt.task() concurrently, otherwise reads can time out
+                            // because responses aren't being processed.
+                            let do_reads = async {
+                                println!("[GATT] Reading values...");
 
-                            if let Some(r) = ble::gatt_client::read_probe_data_list(&gatt, svc, char_list).await {
-                                if let Some(t) = r.temperature_c_x100 {
-                                    println!("temp={:.2}C", t as f32 / 100.0);
+                                let svc = uuid16_to_uuid128(ENVIRONMENTAL_SENSING_SERVICE_UUID16);
+                                let char_list = &[
+                                    uuid16_to_uuid128(TEMP_CHAR_UUID16),
+                                    uuid16_to_uuid128(HUM_CHAR_UUID16),
+                                ];
+
+                                if let Some(r) =
+                                    ble::gatt_client::read_probe_data_list(&gatt, svc, char_list)
+                                        .await
+                                {
+                                    if let Some(t) = r.temperature_c_x100 {
+                                        println!("temp={:.2}C", t as f32 / 100.0);
+                                    }
+                                    if let Some(h) = r.humidity_pct_x100 {
+                                        println!("hum={:.2}%", h as f32 / 100.0);
+                                    }
+                                } else {
+                                    println!("[GATT] Read returned None");
                                 }
-                                if let Some(h) = r.humidity_pct_x100 {
-                                    println!("hum={:.2}%", h as f32 / 100.0);
+                            };
+
+                            match select(gatt.task(), do_reads).await {
+                                Either::First(res) => {
+                                    // gatt.task() ended first (disconnect or error)
+                                    match res {
+                                        Ok(()) => println!("[GATT] task ended"),
+                                        Err(e) => println!("[GATT] task error: {:?}", e),
+                                    }
+                                }
+                                Either::Second(()) => {
+                                    // reads finished; gatt.task() is dropped here
                                 }
                             }
                         }

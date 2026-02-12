@@ -13,13 +13,17 @@ pub struct ProbeReading {
 
 // Typical SIG Temperature (0x2A6E): sint16, unit 0.01°C
 fn parse_temp_i16_x100(p: &[u8]) -> Option<i16> {
-    if p.len() < 2 { return None; }
+    if p.len() < 2 {
+        return None;
+    }
     Some(i16::from_le_bytes([p[0], p[1]]))
 }
 
 // Typical SIG Humidity (0x2A6F): uint16, unit 0.01%
 fn parse_hum_u16_x100(p: &[u8]) -> Option<u16> {
-    if p.len() < 2 { return None; }
+    if p.len() < 2 {
+        return None;
+    }
     Some(u16::from_le_bytes([p[0], p[1]]))
 }
 
@@ -72,17 +76,12 @@ where
         // if uuid128 == HUM_UUID_128 { ... }
 
         // Generic parsing (first successful parser wins):
-        if out.temperature_c_x100.is_none() {
-            if let Some(t) = parse_temp_i16_x100(val) {
-                out.temperature_c_x100 = Some(t);
-                continue;
-            }
+        if let Some(t) = parse_temp_i16_x100(val) {
+            out.temperature_c_x100 = Some(t);
         }
-        if out.humidity_pct_x100.is_none() {
-            if let Some(h) = parse_hum_u16_x100(val) {
-                out.humidity_pct_x100 = Some(h);
-                continue;
-            }
+
+        if let Some(h) = parse_hum_u16_x100(val) {
+            out.humidity_pct_x100 = Some(h);
         }
     }
 
