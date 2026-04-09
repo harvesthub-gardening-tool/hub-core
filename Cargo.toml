@@ -7,6 +7,7 @@ edition = "2021"
 log = "0.4.28"
 embedded-io-async = "0.7.0"
 heapless = "0.9.2"
+embassy-futures = "0.1.2"
 
 [target.xtensa-esp32s3-none-elf.dependencies]
 esp-hal     = { version = "1.0.0-rc.0", features = ["esp32s3", "unstable", "rt"] }
@@ -20,7 +21,7 @@ esp-rtos = { version = "0.2.0", features = ["esp32s3", "esp-radio", "esp-alloc",
 # BLE controller
 esp-radio = { version = "0.17.0", features = ["esp32s3", "ble", "unstable", "esp-alloc"] }
 bt-hci = "0.6" # IMPORTANT: keep bt-hci at 0.6 with trouble-host 0.5.1
-trouble-host = { version = "0.5.1", default-features = false, features = ["central", "default-packet-pool", "default-packet-pool-size-32", "default-packet-pool-mtu-251"] }
+trouble-host = { version = "0.5.1", default-features = false, features = ["central", "gatt", "default-packet-pool", "default-packet-pool-size-32", "default-packet-pool-mtu-251"] }
 
 static_cell = "2.1.0"
 embassy-executor = { version = "0.9.1", default-features = false }

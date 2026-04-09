@@ -147,7 +147,8 @@ impl AdvData {
 
     pub fn print(&self) {
         esp_println::println!(
-            "\t- rssi={}\n\t- kind={:?}\n\t- connectable={}\n\t- scan_response={}\n\t- legacy={}",
+            "\t- addr={:?}\n\t- rssi={}\n\t- kind={:?}\n\t- connectable={}\n\t- scan_response={}\n\t- legacy={}",
+            self.addr,
             self.rssi,
             self.kind,
             self.connectable,
@@ -209,7 +210,7 @@ impl AdvData {
             hexdump("\t   - adv:", self.raw_adv_bytes());
         }
         if self.raw_scan_rsp_len > 0 {
-            esp_println::println!("\traw_scan_rsp: len={}", self.raw_scan_rsp_len);
+            esp_println::println!("\t- raw_scan_rsp: len={}", self.raw_scan_rsp_len);
             hexdump("\t   - rsp:", self.raw_scan_rsp_bytes());
         }
     }
