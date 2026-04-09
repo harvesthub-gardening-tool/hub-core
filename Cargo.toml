@@ -21,8 +21,14 @@ esp-rtos = { version = "0.2.0", features = ["esp32s3", "esp-radio", "esp-alloc",
 # BLE controller
 esp-radio = { version = "0.17.0", features = ["esp32s3", "ble", "unstable", "esp-alloc"] }
 bt-hci = "0.6" # IMPORTANT: keep bt-hci at 0.6 with trouble-host 0.5.1
-trouble-host = { version = "0.5.1", default-features = false, features = ["central", "gatt", "default-packet-pool", "default-packet-pool-size-32", "default-packet-pool-mtu-251"] }
-
+trouble-host = { version = "0.5.1", default-features = false, features = [
+    "central",
+    "gatt",
+    "scan",
+    "default-packet-pool",
+    "default-packet-pool-size-32",
+    "default-packet-pool-mtu-251"
+] }
 static_cell = "2.1.0"
 embassy-executor = { version = "0.9.1", default-features = false }
 embassy-time     = { version = "0.5.0", default-features = false }
