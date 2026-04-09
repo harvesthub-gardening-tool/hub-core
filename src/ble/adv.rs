@@ -1,4 +1,4 @@
-use crate::hexdump;
+use crate::{ble, hexdump};
 use bt_hci::param::{AddrKind, BdAddr};
 
 use crate::config::{COMPANY_ID, COMPANY_NAME, MAGIC_MARKER};
@@ -45,6 +45,48 @@ pub struct AdvData {
 }
 
 impl AdvData {
+    pub fn blank_adv_data(
+        kind: AddrKind,
+        addr: BdAddr,
+        rssi: i8,
+        connectable: bool,
+        scannable: bool,
+        scan_response: bool,
+        legacy: bool,
+    ) -> ble::adv::AdvData {
+        ble::adv::AdvData {
+            kind,
+            addr,
+            rssi,
+
+            connectable,
+            scannable,
+            scan_response,
+            legacy,
+
+            flags: None,
+            name: None,
+            name_len: 0,
+
+            mfg_company_id: None,
+            mfg_data: [0; 24],
+            mfg_len: 0,
+
+            probe_name: None,
+            probe_name_len: 0,
+            probe_ver_major: None,
+            probe_ver_minor: None,
+
+            uuids128: [[0; 16]; 4],
+            uuids128_len: 0,
+
+            raw_adv: [0; 64],
+            raw_adv_len: 0,
+
+            raw_scan_rsp: [0; 64],
+            raw_scan_rsp_len: 0,
+        }
+    }
     pub fn name_str(&self) -> Option<&str> {
         let name = self.name.as_ref()?;
         let n = self.name_len as usize;
