@@ -286,8 +286,15 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
 
                     Timer::after(Duration::from_millis(150)).await;
 
-                    match central.connect_ext(&cfg).await {
-                        Ok(conn) => {
+                    match select(
+                        Timer::after(Duration::from_secs(3)),
+                        central.connect_ext(&cfg),
+                    ).await {
+                        Either::First(_) => {
+                            println!("[HUB] Connect timeout");
+                            Timer::after(Duration::from_millis(200)).await;
+                        }
+                        Either::Second(Ok(conn)) => {
                             println!("[HUB] Connected handle={:?}", conn.handle());
 
                             println!("[GATT] Creating client...");
@@ -345,7 +352,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                             conn.disconnect();
                             Timer::after(Duration::from_secs(1)).await;
                         }
-                        Err(e) => {
+                        Either::Second(Err(e)) => {
                             println!("[HUB] Connect failed: {:?}", e);
                             Timer::after(Duration::from_secs(2)).await;
                         }
