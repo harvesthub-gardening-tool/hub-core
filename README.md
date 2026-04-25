@@ -2,17 +2,21 @@
 
 ### 1. Commands
 
-- Build and Flash ESP32s3
-```
-cargo run --release --bin hub-core-fw --target xtensa-esp32s3-none-elf -Z build-std=core,alloc,compiler_builtins
-```
+````powershell
+$env:WIFI_SSID = "YOUR_WIFI"
+$env:WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
+````
+````
+cargo +esp check
+````
+````
+cargo +esp run
+````
 
-- Erase ESP32s3
+- ESP
 ```
 espflash erase-flash --chip esp32s3
 ```
-
-- Connect to ESP32s3 (COM)
 ```
 espflash monitor --baud 115200
 ```

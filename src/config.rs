@@ -1,8 +1,7 @@
 pub const COMPANY_ID: u16 = 0x1234;
-pub const COMPANY_NAME: &str = "HarvestHub";
-pub const MAGIC_MARKER: [u8; 8] = *b"HH-PROBE";
-pub const SCAN_WAIT_SECONDS: u64 = 30;
+pub const MAGIC_MARKER: &[u8] = b"HH-PROBE";
 
-pub const ENVIRONMENTAL_SENSING_SERVICE_UUID16: u16 = 0x181A;
-pub const TEMP_CHAR_UUID16: u16 = 0x2A6E;
-pub const HUM_CHAR_UUID16: u16 = 0x2A6F;
+// Environmental Sensing
+pub const ENVIRONMENTAL_SENSING_SERVICE_UUID: &str = "0000181a-0000-1000-8000-00805f9b34fb";
+pub const TEMP_CHAR_UUID: &str = "00002a6e-0000-1000-8000-00805f9b34fb";
+pub const HUM_CHAR_UUID: &str = "00002a6f-0000-1000-8000-00805f9b34fb";
