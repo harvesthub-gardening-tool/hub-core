@@ -1,14 +1,15 @@
 use anyhow::Result;
-use protos_rust::auth::v1::{auth_service_client::AuthServiceClient, LoginRequest};
 use protos_rust::garden::v1::{
-    garden_service_client::GardenServiceClient,
-    InsertSensorDataRequest,
+    garden_service_client::GardenServiceClient, InsertSensorDataRequest,
 };
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
+
+const API_URL: &str = env!("API_URL");
+const API_TOKEN: &str = env!("API_TOKEN");
 
 #[derive(Clone)]
 struct AuthInterceptor {
@@ -28,24 +29,15 @@ pub struct HubClient {
 }
 
 impl HubClient {
-    pub async fn new(server_url: &str, email: &str, password: &str) -> Result<Self> {
-        let channel = Endpoint::from_shared(server_url.to_string())?
+    pub async fn connect() -> Result<Self> {
+        let channel = Endpoint::from_static(API_URL)
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(20))
             .connect()
             .await?;
 
-        let mut auth_client = AuthServiceClient::new(channel.clone());
-
-        let login_resp = auth_client
-            .login(LoginRequest {
-                email: email.to_string(),
-                password: password.to_string(),
-            })
-            .await?
-            .into_inner();
-
-        let token: MetadataValue<_> = format!("Bearer {}", login_resp.token).parse()?;
+        let token: MetadataValue<_> = format!("Bearer {}", API_TOKEN).parse()?;
         let interceptor = AuthInterceptor { token };
-
         let service = InterceptedService::new(channel, interceptor);
         let garden_client = GardenServiceClient::new(service);
 
@@ -60,7 +52,8 @@ impl HubClient {
         soil_moisture: f64,
         timestamp: i64,
     ) -> Result<()> {
-        self.garden_client
+        let resp = self
+            .garden_client
             .insert_sensor_data(InsertSensorDataRequest {
                 node_id: node_id.to_string(),
                 temperature,
@@ -68,8 +61,12 @@ impl HubClient {
                 soil_moisture,
                 timestamp,
             })
-            .await?;
+            .await?
+            .into_inner();
 
+        if !resp.success {
+            anyhow::bail!("InsertSensorData rejected by server: {}", resp.message);
+        }
         Ok(())
     }
 }

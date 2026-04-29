@@ -153,7 +153,7 @@ pub(crate) async fn read_probe_from_device(
     Ok(Some(ProbeReading {
         temperature_c,
         humidity_pct,
-        timestamp: time::get_unix_now(),
+        timestamp: time::get_unix_now_ms(),
     }))
 }
 

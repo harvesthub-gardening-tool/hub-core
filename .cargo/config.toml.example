@@ -19,5 +19,9 @@ ESP_IDF_PATH_ISSUES = "warn"
 # Required for now due to embuild limitations.
 #CARGO_WORKSPACE_DIR = { value = "", relative = true }
 
-WIFI_SSID = "YOUR_WIFI"
-WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
+WIFI_SSID = "your-wifi-ssid"
+WIFI_PASSWORD = "your-wifi-password"
+
+API_URL = "http://harvest-hub-api.grimmely.com"
+API_TOKEN = "paste-long-lived-hub-jwt-here"
+HUB_NODE_ID = "esp32s3-garden-hub-1"

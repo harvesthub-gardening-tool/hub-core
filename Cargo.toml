@@ -29,5 +29,11 @@ tonic = { version = "0.14.5", features = ["transport"] }
 prost = "0.14.3"
 protos-rust = { git = "https://github.com/harvesthub-gardening-tool/protos-rust" }
 
+[features]
+default = []
+# Inject one synthetic SensorReading per scan cycle. Used to verify the
+# gRPC uplink end-to-end without a physical BLE probe in range.
+fake-probe = []
+
 [build-dependencies]
 embuild = "0.33"
