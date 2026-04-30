@@ -1414,8 +1414,8 @@ dependencies = [
 
 [[package]]
 name = "protos-rust"
-version = "0.0.0-fecd30c"
-source = "git+https://github.com/harvesthub-gardening-tool/protos-rust?rev=b274c2e3c36bfaa3770fa16df552640728a1d47a#b274c2e3c36bfaa3770fa16df552640728a1d47a"
+version = "0.0.0-6da113d"
+source = "git+https://github.com/harvesthub-gardening-tool/protos-rust?rev=f2dc4ca24da31612e75986ae119129fbeb130c30#f2dc4ca24da31612e75986ae119129fbeb130c30"
 dependencies = [
  "prost",
  "tonic",
