@@ -51,7 +51,9 @@ fn main() -> Result<()> {
     // Resolve hub identity + JWT. Order matters: `esp_fill_random` (used inside
     // `persist::load_or_generate_creds`) only emits CSPRNG-quality output once
     // Wi-Fi has been started, which is guaranteed by the calls above.
-    let (device_id, jwt) = provision_hub(nvs.clone())?;
+    let (hub_device_id, jwt) = provision_hub(nvs.clone())?;
+    #[cfg(not(feature = "fake-probe"))]
+    drop(hub_device_id);
 
     let (tx, rx) = mpsc::sync_channel::<SensorReading>(UPLINK_QUEUE_DEPTH);
     spawn_uplink_worker(rx, jwt)?;
@@ -60,7 +62,7 @@ fn main() -> Result<()> {
     info!("BLE device ready");
 
     loop {
-        let candidates = match block_on(ble::scan_probe_candidates(&ble_device)) {
+        let candidates = match block_on(ble::scan_probe_candidates(ble_device)) {
             Ok(v) => v,
             Err(e) => {
                 error!("scan_probe_candidates failed: {e:#}");
@@ -75,7 +77,7 @@ fn main() -> Result<()> {
         {
             let now_ms = unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) as i64 } * 1000;
             let fake = SensorReading {
-                node_id: device_id.clone(),
+                node_id: hub_device_id.clone(),
                 air_temperature_c: 21.5,
                 air_pressure_pa: 101_325.0,
                 air_humidity_pct: 48.0,
@@ -96,11 +98,12 @@ fn main() -> Result<()> {
         }
 
         for candidate in &candidates {
-            match block_on(ble::read_probe_from_device(&ble_device, &candidate.device)) {
+            match block_on(ble::read_probe_from_device(ble_device, &candidate.device)) {
                 Ok(Some(reading)) => {
                     info!(
-                        "probe reading: addr={:?} name='{}' version={}.{} air_temp={:.2}°C air_pressure={:.0}Pa air_hum={:.2}% soil_temp={:.2}°C soil_hum={:.2}% ts={}",
+                        "probe reading: addr={:?} probe_uuid={} name='{}' version={}.{} air_temp={:.2}°C air_pressure={:.0}Pa air_hum={:.2}% soil_temp={:.2}°C soil_hum={:.2}% ts={}",
                         candidate.device.addr(),
+                        reading.probe_uuid.as_str(),
                         candidate.meta.name,
                         candidate.meta.version_major,
                         candidate.meta.version_minor,
@@ -113,7 +116,7 @@ fn main() -> Result<()> {
                     );
 
                     let msg = SensorReading {
-                        node_id: device_id.clone(),
+                        node_id: reading.probe_uuid.clone(),
                         air_temperature_c: reading.air_temperature_c,
                         air_pressure_pa: reading.air_pressure_pa,
                         air_humidity_pct: reading.air_humidity_pct,

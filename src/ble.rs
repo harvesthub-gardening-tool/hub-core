@@ -1,18 +1,20 @@
 use crate::config::{
     AIR_HUM_CHAR_UUID, AIR_PRESSURE_CHAR_UUID, AIR_TEMP_CHAR_UUID, COMPANY_ID,
-    ENVIRONMENTAL_SENSING_SERVICE_UUID, LEGACY_TEST_MARKER, MAGIC_MARKER, SOIL_HUM_CHAR_UUID,
-    SOIL_TEMP_CHAR_UUID,
+    ENVIRONMENTAL_SENSING_SERVICE_UUID, LEGACY_TEST_MARKER, MAGIC_MARKER, PROBE_UUID_CHAR_UUID,
+    SOIL_HUM_CHAR_UUID, SOIL_TEMP_CHAR_UUID,
 };
 use crate::time;
 use anyhow::{bail, Context};
 use esp32_nimble::{uuid128, BLEAdvertisedDevice, BLEDevice, BLEScan};
 use log::info;
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 const BLE_SCAN_MS: u64 = 8_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProbeReading {
+    pub(crate) probe_uuid: String,
     pub(crate) air_temperature_c: f64,
     pub(crate) air_pressure_pa: f64,
     pub(crate) air_humidity_pct: f64,
@@ -39,7 +41,7 @@ pub fn init_device() -> &'static mut BLEDevice {
 }
 
 pub async fn scan_probe_candidates(ble_device: &BLEDevice) -> anyhow::Result<Vec<ProbeCandidate>> {
-    let seen = Arc::new(Mutex::new(Vec::<ProbeCandidate>::new()));
+    let seen = Rc::new(RefCell::new(Vec::<ProbeCandidate>::new()));
     let seen_cb = seen.clone();
 
     let mut ble_scan = BLEScan::new();
@@ -52,15 +54,10 @@ pub async fn scan_probe_candidates(ble_device: &BLEDevice) -> anyhow::Result<Vec
             ble_device,
             BLE_SCAN_MS as i32,
             move |device, data| -> Option<BLEAdvertisedDevice> {
-                let Some(mfg) = data.manufacture_data() else {
-                    return None;
-                };
+                let mfg = data.manufacture_data()?;
+                let meta = parse_probe_meta(mfg.company_identifier, mfg.payload)?;
 
-                let Some(meta) = parse_probe_meta(mfg.company_identifier, mfg.payload) else {
-                    return None;
-                };
-
-                let mut seen = seen_cb.lock().unwrap();
+                let mut seen = seen_cb.borrow_mut();
 
                 let already_seen = seen.iter().any(|d| d.device.addr() == device.addr());
                 if !already_seen {
@@ -100,7 +97,7 @@ pub async fn scan_probe_candidates(ble_device: &BLEDevice) -> anyhow::Result<Vec
         )
         .await?;
 
-    let devices = seen.lock().unwrap().clone();
+    let devices = seen.borrow().clone();
     Ok(devices)
 }
 
@@ -192,6 +189,17 @@ pub(crate) async fn read_probe_from_device(
         }
     };
 
+    let probe_uuid = match service
+        .get_characteristic(uuid128!(PROBE_UUID_CHAR_UUID))
+        .await
+    {
+        Ok(chr) => {
+            let raw = chr.read_value().await.context("probe uuid read failed")?;
+            parse_probe_uuid_ascii(&raw).unwrap_or_else(|| device.addr().to_string())
+        }
+        Err(_) => device.addr().to_string(),
+    };
+
     info!("raw air temp bytes={:02X?}", air_temp_raw);
     info!("raw air pressure bytes={:02X?}", air_pressure_raw);
     info!("raw air hum bytes={:02X?}", air_hum_raw);
@@ -207,6 +215,7 @@ pub(crate) async fn read_probe_from_device(
     let _ = client.disconnect();
 
     Ok(Some(ProbeReading {
+        probe_uuid,
         air_temperature_c,
         air_pressure_pa,
         air_humidity_pct,
@@ -283,4 +292,17 @@ fn parse_centi_percent_u16(raw: &[u8], label: &str) -> anyhow::Result<f64> {
 
     let value = u16::from_be_bytes([raw[0], raw[1]]);
     Ok(value as f64 / 100.0)
+}
+
+fn parse_probe_uuid_ascii(raw: &[u8]) -> Option<String> {
+    if raw.len() != 36 {
+        return None;
+    }
+
+    let value = core::str::from_utf8(raw).ok()?;
+    if value.len() != 36 {
+        return None;
+    }
+
+    Some(value.to_string())
 }
