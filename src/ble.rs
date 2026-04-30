@@ -1,18 +1,24 @@
 use crate::config::{
-    COMPANY_ID, ENVIRONMENTAL_SENSING_SERVICE_UUID, HUM_CHAR_UUID, MAGIC_MARKER, TEMP_CHAR_UUID,
+    AIR_PRESSURE_CHAR_UUID, COMPANY_ID, ENVIRONMENTAL_SENSING_SERVICE_UUID, HUM_CHAR_UUID,
+    MAGIC_MARKER, PROBE_UUID_CHAR_UUID, SOIL_HUM_CHAR_UUID, SOIL_TEMP_CHAR_UUID, TEMP_CHAR_UUID,
 };
 use crate::time;
 use anyhow::{bail, Context};
 use esp32_nimble::{uuid128, BLEAdvertisedDevice, BLEDevice, BLEScan};
 use log::info;
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 const BLE_SCAN_MS: u64 = 8_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProbeReading {
-    pub(crate) temperature_c: f64,
-    pub(crate) humidity_pct: f64,
+    pub(crate) probe_uuid: String,
+    pub(crate) air_temperature_c: f64,
+    pub(crate) air_pressure_pa: f64,
+    pub(crate) air_humidity_pct: f64,
+    pub(crate) soil_temperature_c: f64,
+    pub(crate) soil_humidity_pct: f64,
     pub(crate) timestamp: i64,
 }
 
@@ -34,7 +40,7 @@ pub fn init_device() -> &'static mut BLEDevice {
 }
 
 pub async fn scan_probe_candidates(ble_device: &BLEDevice) -> anyhow::Result<Vec<ProbeCandidate>> {
-    let seen = Arc::new(Mutex::new(Vec::<ProbeCandidate>::new()));
+    let seen = Rc::new(RefCell::new(Vec::<ProbeCandidate>::new()));
     let seen_cb = seen.clone();
 
     let mut ble_scan = BLEScan::new();
@@ -47,15 +53,11 @@ pub async fn scan_probe_candidates(ble_device: &BLEDevice) -> anyhow::Result<Vec
             ble_device,
             BLE_SCAN_MS as i32,
             move |device, data| -> Option<BLEAdvertisedDevice> {
-                let Some(mfg) = data.manufacture_data() else {
-                    return None;
-                };
+                let mfg = data.manufacture_data()?;
 
-                let Some(meta) = parse_probe_meta(mfg.company_identifier, mfg.payload) else {
-                    return None;
-                };
+                let meta = parse_probe_meta(mfg.company_identifier, mfg.payload)?;
 
-                let mut seen = seen_cb.lock().unwrap();
+                let mut seen = seen_cb.borrow_mut();
 
                 let already_seen = seen.iter().any(|d| d.device.addr() == device.addr());
                 if !already_seen {
@@ -95,7 +97,7 @@ pub async fn scan_probe_candidates(ble_device: &BLEDevice) -> anyhow::Result<Vec
         )
         .await?;
 
-    let devices = seen.lock().unwrap().clone();
+    let devices = seen.borrow().clone();
     Ok(devices)
 }
 
@@ -142,17 +144,83 @@ pub(crate) async fn read_probe_from_device(
         }
     };
 
-    info!("raw temp bytes={:02X?}", temp_raw);
-    info!("raw hum bytes={:02X?}", hum_raw);
+    let pressure_raw = match service
+        .get_characteristic(uuid128!(AIR_PRESSURE_CHAR_UUID))
+        .await
+    {
+        Ok(pressure_chr) => pressure_chr
+            .read_value()
+            .await
+            .context("air pressure read failed")?,
+        Err(_) => {
+            let _ = client.disconnect();
+            return Ok(None);
+        }
+    };
 
-    let temperature_c = parse_temperature_c(&temp_raw)?;
-    let humidity_pct = parse_humidity_pct(&hum_raw)?;
+    let soil_temp_raw = match service
+        .get_characteristic(uuid128!(SOIL_TEMP_CHAR_UUID))
+        .await
+    {
+        Ok(soil_temp_chr) => soil_temp_chr
+            .read_value()
+            .await
+            .context("soil temperature read failed")?,
+        Err(_) => {
+            let _ = client.disconnect();
+            return Ok(None);
+        }
+    };
+
+    let soil_hum_raw = match service
+        .get_characteristic(uuid128!(SOIL_HUM_CHAR_UUID))
+        .await
+    {
+        Ok(soil_hum_chr) => soil_hum_chr
+            .read_value()
+            .await
+            .context("soil humidity read failed")?,
+        Err(_) => {
+            let _ = client.disconnect();
+            return Ok(None);
+        }
+    };
+
+    let probe_uuid = match service
+        .get_characteristic(uuid128!(PROBE_UUID_CHAR_UUID))
+        .await
+    {
+        Ok(uuid_chr) => {
+            let raw = uuid_chr
+                .read_value()
+                .await
+                .context("probe uuid read failed")?;
+            parse_probe_uuid_ascii(&raw).unwrap_or_else(|| device.addr().to_string())
+        }
+        Err(_) => device.addr().to_string(),
+    };
+
+    info!("raw temp bytes={:02X?}", temp_raw);
+    info!("raw pressure bytes={:02X?}", pressure_raw);
+    info!("raw hum bytes={:02X?}", hum_raw);
+    info!("raw soil temp bytes={:02X?}", soil_temp_raw);
+    info!("raw soil hum bytes={:02X?}", soil_hum_raw);
+
+    let air_temperature_c = parse_temperature_c(&temp_raw)?;
+    let air_pressure_pa = parse_pressure_pa(&pressure_raw)?;
+    let air_humidity_pct = parse_humidity_pct(&hum_raw)?;
+    let soil_temperature_c = parse_soil_temperature_c(&soil_temp_raw)?;
+    let soil_humidity_pct = parse_soil_humidity_pct(&soil_hum_raw)?;
 
     let _ = client.disconnect();
 
     Ok(Some(ProbeReading {
-        temperature_c,
-        humidity_pct,
+        probe_uuid,
+        air_temperature_c,
+        air_pressure_pa,
+        air_humidity_pct,
+        soil_temperature_c,
+        soil_humidity_pct,
         timestamp: time::get_unix_now_ms(),
     }))
 }
@@ -207,4 +275,44 @@ fn parse_humidity_pct(raw: &[u8]) -> anyhow::Result<f64> {
 
     let value = u16::from_be_bytes([raw[0], raw[1]]);
     Ok(value as f64 / 100.0)
+}
+
+fn parse_pressure_pa(raw: &[u8]) -> anyhow::Result<f64> {
+    if raw.len() < 4 {
+        bail!("pressure payload too short: {:?}", raw);
+    }
+
+    let value = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    Ok(value as f64)
+}
+
+fn parse_soil_temperature_c(raw: &[u8]) -> anyhow::Result<f64> {
+    if raw.len() < 2 {
+        bail!("soil temperature payload too short: {:?}", raw);
+    }
+
+    let value = i16::from_be_bytes([raw[0], raw[1]]);
+    Ok(value as f64 / 100.0)
+}
+
+fn parse_soil_humidity_pct(raw: &[u8]) -> anyhow::Result<f64> {
+    if raw.len() < 2 {
+        bail!("soil humidity payload too short: {:?}", raw);
+    }
+
+    let value = u16::from_be_bytes([raw[0], raw[1]]);
+    Ok(value as f64 / 100.0)
+}
+
+fn parse_probe_uuid_ascii(raw: &[u8]) -> Option<String> {
+    if raw.len() != 36 {
+        return None;
+    }
+
+    let value = core::str::from_utf8(raw).ok()?;
+    if value.len() != 36 {
+        return None;
+    }
+
+    Some(value.to_string())
 }

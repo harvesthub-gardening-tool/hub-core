@@ -49,7 +49,9 @@ fn main() -> Result<()> {
     // Resolve hub identity + JWT. Order matters: `esp_fill_random` (used inside
     // `persist::load_or_generate_creds`) only emits CSPRNG-quality output once
     // Wi-Fi has been started, which is guaranteed by the calls above.
-    let (device_id, jwt) = provision_hub(nvs.clone())?;
+    let (hub_device_id, jwt) = provision_hub(nvs.clone())?;
+    #[cfg(not(feature = "fake-probe"))]
+    drop(hub_device_id);
 
     let (tx, rx) = mpsc::sync_channel::<SensorReading>(UPLINK_QUEUE_DEPTH);
     spawn_uplink_worker(rx, jwt)?;
@@ -58,7 +60,7 @@ fn main() -> Result<()> {
     info!("BLE device ready");
 
     loop {
-        let candidates = match block_on(ble::scan_probe_candidates(&ble_device)) {
+        let candidates = match block_on(ble::scan_probe_candidates(ble_device)) {
             Ok(v) => v,
             Err(e) => {
                 error!("scan_probe_candidates failed: {e:#}");
@@ -73,7 +75,7 @@ fn main() -> Result<()> {
         {
             let now_ms = unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) as i64 } * 1000;
             let fake = SensorReading {
-                node_id: device_id.clone(),
+                node_id: hub_device_id.clone(),
                 temperature_c: 21.5,
                 humidity_pct: 48.0,
                 soil_moisture_pct: 33.3,
@@ -92,24 +94,35 @@ fn main() -> Result<()> {
         }
 
         for candidate in &candidates {
-            match block_on(ble::read_probe_from_device(&ble_device, &candidate.device)) {
+            match block_on(ble::read_probe_from_device(ble_device, &candidate.device)) {
                 Ok(Some(reading)) => {
                     info!(
-                        "probe reading: addr={:?} name='{}' version={}.{} temp={:.2}°C hum={:.2}% ts={}",
+                        "probe reading: addr={:?} probe_uuid={} name='{}' version={}.{} air_temp={:.2}°C air_pressure={:.0}Pa air_hum={:.2}% soil_temp={:.2}°C soil_hum={:.2}% ts={}",
                         candidate.device.addr(),
+                        reading.probe_uuid.as_str(),
                         candidate.meta.name,
                         candidate.meta.version_major,
                         candidate.meta.version_minor,
-                        reading.temperature_c,
-                        reading.humidity_pct,
+                        reading.air_temperature_c,
+                        reading.air_pressure_pa,
+                        reading.air_humidity_pct,
+                        reading.soil_temperature_c,
+                        reading.soil_humidity_pct,
                         reading.timestamp
                     );
 
+                    info!(
+                        "probe extra fields not uplinked yet: probe_uuid={} air_pressure_pa={:.0} soil_temperature_c={:.2}",
+                        reading.probe_uuid.as_str(),
+                        reading.air_pressure_pa,
+                        reading.soil_temperature_c
+                    );
+
                     let msg = SensorReading {
-                        node_id: device_id.clone(),
-                        temperature_c: reading.temperature_c,
-                        humidity_pct: reading.humidity_pct,
-                        soil_moisture_pct: 0.0,
+                        node_id: reading.probe_uuid.clone(),
+                        temperature_c: reading.air_temperature_c,
+                        humidity_pct: reading.air_humidity_pct,
+                        soil_moisture_pct: reading.soil_humidity_pct,
                         timestamp_unix: reading.timestamp,
                     };
                     if let Err(e) = tx.try_send(msg) {
