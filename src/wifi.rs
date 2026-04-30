@@ -7,10 +7,13 @@ use log::{error, info};
 use std::thread;
 use std::time::Duration;
 
-pub fn init() -> Result<BlockingWifi<EspWifi<'static>>, EspError> {
+// NVS partition is taken once in `main` and shared across subsystems
+// (Wi-Fi calibration storage + hub-token persistence). Passing it in
+// avoids the one-shot `EspDefaultNvsPartition::take()` failing on the
+// second caller.
+pub fn init(nvs: EspDefaultNvsPartition) -> Result<BlockingWifi<EspWifi<'static>>, EspError> {
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
-    let nvs = EspDefaultNvsPartition::take()?;
 
     let wifi = BlockingWifi::wrap(
         EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,

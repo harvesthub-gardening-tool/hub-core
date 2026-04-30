@@ -1,5 +1,5 @@
 use anyhow::Result;
-use protos_rust::garden::v1::{
+use protos_rust::garden::v2::{
     garden_service_client::GardenServiceClient, InsertSensorDataRequest,
 };
 use tonic::metadata::MetadataValue;
@@ -9,7 +9,6 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
 const API_URL: &str = env!("API_URL");
-const API_TOKEN: &str = env!("API_TOKEN");
 
 #[derive(Clone)]
 struct AuthInterceptor {
@@ -29,15 +28,15 @@ pub struct HubClient {
 }
 
 impl HubClient {
-    pub async fn connect() -> Result<Self> {
+    pub async fn connect_with_token(token: &str) -> Result<Self> {
         let channel = Endpoint::from_static(API_URL)
             .connect_timeout(std::time::Duration::from_secs(15))
             .timeout(std::time::Duration::from_secs(20))
             .connect()
             .await?;
 
-        let token: MetadataValue<_> = format!("Bearer {}", API_TOKEN).parse()?;
-        let interceptor = AuthInterceptor { token };
+        let metadata: MetadataValue<_> = format!("Bearer {}", token).parse()?;
+        let interceptor = AuthInterceptor { token: metadata };
         let service = InterceptedService::new(channel, interceptor);
         let garden_client = GardenServiceClient::new(service);
 

@@ -9,9 +9,12 @@ once; come back to the table at the end if you just need the deltas.
 ## TL;DR
 
 Firmware now talks to the production API over **plaintext h2c on port 80**, using
-a **long-lived hub JWT** (no Login flow), with timestamps in **Unix
-milliseconds**. We could not use TLS because the `ring` crate has no Xtensa
-assembly, so the tonic TLS stack does not build for `xtensa-esp32s3-espidf`.
+a **hub JWT obtained at first boot via `auth.v2.ClaimHubToken`** (no Login flow
+on the device, no end-user password ever stored), with timestamps in **Unix
+milliseconds**. Hub identity (`device_id` + `hub_secret`) is generated on-device
+and printed to serial as a QR payload for the mobile app to associate. We could
+not use TLS because the `ring` crate has no Xtensa assembly, so the tonic TLS
+stack does not build for `xtensa-esp32s3-espidf`.
 
 ---
 
@@ -46,34 +49,57 @@ assembly, so the tonic TLS stack does not build for `xtensa-esp32s3-espidf`.
 
 ---
 
-## 2. Auth: pre-issued long-lived hub JWT (no Login on device)
+## 2. Auth: hub-generated identity + one-shot `auth.v2.ClaimHubToken`
 
 ### What we changed
 
-- The hub **does not** call `AuthService.Login`. Wi-Fi creds and account
-  passwords never leave the device-onboarding flow.
-- Instead, when a user pairs a hub, the backend mints a long-lived JWT
-  (`CreateHubToken`, RS256, multi-month expiry, `user_id` claim baked in).
-- That token is provisioned once into `.cargo/config.toml` (build-time `env!`)
-  and the firmware sends it as `Authorization: Bearer <token>` on every gRPC
-  call via a tonic `AuthInterceptor`.
+- The hub generates its own `device_id` (random UUIDv4) and `hub_secret`
+  (32 random bytes hex, 64 chars) on first boot and persists both to NVS
+  (namespace `hub`, keys `device_id` / `hub_secret`).
+- It prints both as a "QR payload" block to the serial log. The owner scans
+  that into the mobile app, which calls `auth.v2.AuthService/AssociateHub` with
+  their user JWT, binding `(device_id, hub_secret)` to their account.
+- After AssociateHub has run server-side, the hub calls
+  `auth.v2.AuthService/ClaimHubToken(device_id, hub_secret)` exactly once.
+  The server returns a long-lived hub JWT (RS256, 1-year expiry, empty
+  username, `hub_id` claim populated). The hub stores it in NVS under `jwt`.
+- All subsequent boots read the JWT from NVS and skip the claim step. The
+  firmware sends it as `Authorization: Bearer <token>` on every gRPC call via
+  a tonic `AuthInterceptor`.
+- A build-time `HUB_TOKEN` env var is the dev-only override: if set, NVS is
+  pre-seeded with that JWT and the generate / log / claim path is skipped
+  entirely. Useful for local development against a wiped backend.
 
 ### Why
 
 - A device should not store an end-user password. Compromising one hub would
   compromise the user's whole account.
-- A long-lived hub-scoped token is revocable server-side without touching the
-  user's password.
-- Single round-trip per RPC: no Login step, no refresh dance, no token cache to
-  manage on a device that loses RAM on every boot.
-- Build-time injection (`env!` in `grpc.rs`) keeps the token out of source
-  control — it lives only in `.cargo/config.toml` (gitignored, see §6).
+- Hub-generated `(device_id, hub_secret)` removes the need for a build-time
+  per-device provisioning step. The same firmware image can be flashed onto
+  every hub; identity emerges at first boot from the on-board CSPRNG.
+- `esp_fill_random` is only CSPRNG-quality once Wi-Fi or BLE is up, so
+  `provision_hub` runs **after** `wifi::connect`. Reordering would silently
+  downgrade entropy to pseudo-random — flagged in `persist.rs` and `main.rs`.
+- Splitting AssociateHub (mobile, user JWT) from ClaimHubToken (hub, no auth)
+  keeps the user's credentials off the device while still proving the user
+  consented to this specific hub.
+- Claim-once on the server side: a successful `ClaimHubToken` is recorded on
+  the `hub_tokens` row, and any retry returns `FAILED_PRECONDITION`. The hub
+  surfaces this as `auth::AlreadyClaimed` and halts with an instruction to
+  call `auth.v2.RevokeHub` from the mobile app.
+- Single round-trip per data RPC after provisioning: no Login step, no refresh
+  dance, no token cache to rebuild on every boot.
 
 ### Decision boundary
 
-- Token rotation today = re-flash. Acceptable while the fleet is one device.
-  Future work: GATT-based provisioning, or a one-shot pairing API that lets the
-  hub fetch a fresh token over BLE.
+- The 1-year expiry on hub JWTs is a backend constant. Renewal flow is not yet
+  implemented; expect a re-claim cycle in ~12 months.
+- `espflash erase-flash` wipes `device_id`, `hub_secret`, and the JWT. The
+  next boot generates a fresh `device_id`, so the previous server-side
+  binding becomes orphaned. Either set `HUB_TOKEN` for the next boot, or have
+  the user `RevokeHub` + AssociateHub the new device_id.
+- ClaimHubToken **must** run after SNTP sync; the issued JWT's `nbf` / `iat`
+  are validated against the device clock on every subsequent call.
 
 ---
 
@@ -185,8 +211,9 @@ assembly, so the tonic TLS stack does not build for `xtensa-esp32s3-espidf`.
 
 ### What we changed
 
-- `.cargo/config.toml` is **untracked**. It holds Wi-Fi creds and the hub JWT
-  in its `[env]` block, consumed by `env!()` macros at compile time.
+- `.cargo/config.toml` is **untracked**. It holds Wi-Fi creds and (optionally)
+  the dev `HUB_TOKEN` in its `[env]` block, consumed by `env!()` /
+  `option_env!()` macros at compile time.
 - `.cargo/config.toml.example` is committed, with placeholder values, and is
   the template a teammate copies.
 - `.gitignore` now has the precise rule `/.cargo/config.toml` (not the broader
@@ -210,12 +237,20 @@ assembly, so the tonic TLS stack does not build for `xtensa-esp32s3-espidf`.
 
 ```bash
 cp .cargo/config.toml.example .cargo/config.toml
-# then edit WIFI_SSID, WIFI_PASSWORD, API_TOKEN
+# edit WIFI_SSID, WIFI_PASSWORD, API_URL
+# HUB_TOKEN is optional — leave commented out to exercise the production
+# first-boot flow (hub generates creds, prints QR, calls ClaimHubToken).
 ```
 
-Get an API_TOKEN by calling `AuthService.CreateHubToken` after logging in as
-the user that owns the hub. The token is RS256-signed, contains `user_id`, and
-defaults to a multi-month expiry.
+For end-to-end provisioning without the mobile app, mimic its calls with curl:
+
+```bash
+# 1. Register / Login a user, save user_jwt
+# 2. Boot the hub once; copy device_id + hub_secret from the serial log
+# 3. POST /auth.v2.AuthService/AssociateHub with Authorization: Bearer <user_jwt>
+#    body: {"device_id": "...", "hub_secret": "..."}
+# 4. Reboot the hub — it calls ClaimHubToken and persists the JWT.
+```
 
 ### Decision boundary
 
@@ -223,6 +258,8 @@ defaults to a multi-month expiry.
   review your staging area before any commit that touches `.cargo/`.
 - If a real secret ever lands in a commit, **rotate** it; do not rely on
   history rewrites alone.
+- `HUB_TOKEN` is a **dev-only** shortcut. Production builds must leave it
+  unset so every device exercises the hub-generated identity flow.
 
 ---
 
@@ -236,9 +273,11 @@ defaults to a multi-month expiry.
 | `src/main.rs`                | `uplink` worker thread (32 KB stack, current_thread Tokio)       | Isolate networking from `!Send` BLE               |
 | `src/main.rs`                | `mpsc::sync_channel<SensorReading>` BLE → uplink                 | Backpressure without blocking BLE                 |
 | `src/main.rs`                | `fake-probe` cfg-gated synthetic reading                         | End-to-end test without hardware                  |
-| `src/grpc.rs`                | Token-direct `HubClient::connect()` (no Login)                   | Hub-scoped long-lived JWT                         |
+| `src/grpc.rs`                | `HubClient::connect_with_token(&jwt)` (no Login)                 | Hub-scoped JWT obtained via auth.v2 ClaimHubToken |
 | `src/grpc.rs`                | `AuthInterceptor` injects `Authorization: Bearer …`              | Auth on every RPC                                 |
 | `src/grpc.rs`                | Reuse `Channel`, reconnect on RPC error                          | ~60 ms latency vs ~hundreds on fresh dial         |
+| `src/auth.rs`                | `claim_hub_token` client + `AlreadyClaimed` error                | One-shot `auth.v2.ClaimHubToken` exchange         |
+| `src/persist.rs`             | NVS `hub` namespace: `device_id`, `hub_secret`, `jwt`            | Persist hub identity + uplink JWT across reboots  |
 | `Cargo.toml`                 | `[features] fake-probe = []`                                     | Opt-in synthetic injection                        |
 | `sdkconfig.defaults`         | Bumped main / pthread stacks; lwIP MAX_SOCKETS, TCP_MSS, SND/WND | Avoid silent stack-overflow on TLS-less h2c paths |
 | `.cargo/config.toml`         | **Untracked** (per-developer secrets via `env!`)                 | Don't commit Wi-Fi / hub token                    |
@@ -250,10 +289,11 @@ defaults to a multi-month expiry.
 
 ## Known follow-ups (not in this fix)
 
-1. **Tenant isolation** in `garden.GetSummary` and `InsertSensorData`. Today,
-   `sensor_data` rows are keyed only by `node_id`; no `user_id` column exists,
-   no `WHERE user_id = ?` filter on read. Any authenticated user can read any
-   node's data. Required before the API serves more than one user.
-2. **Hub token rotation flow.** Currently re-flash. Plan: BLE-mediated
-   provisioning, or a paired-device API.
-3. **Production build hygiene** that rejects `fake-probe`.
+1. **Hub JWT renewal.** Tokens expire after 1 year. No automatic renewal flow
+   exists today; expect to either re-claim (after the user calls RevokeHub) or
+   add a refresh RPC before then.
+2. **TLS for production.** Plaintext h2c is acceptable on the dev network only.
+   Likely path: terminate TLS at Traefik using mbedTLS via `esp-idf-svc` and a
+   custom hyper connector.
+3. **Production build hygiene** that rejects `fake-probe` and unset `HUB_TOKEN`
+   in release artifacts.
