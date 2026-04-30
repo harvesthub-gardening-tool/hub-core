@@ -54,8 +54,6 @@ pub async fn claim_hub_token(
     match resp {
         Ok(ok) => Ok(ok.into_inner().token),
         Err(status) if status.code() == Code::FailedPrecondition => Err(AlreadyClaimed.into()),
-        Err(status) => {
-            Err(anyhow::anyhow!(status).context("auth.v2.ClaimHubToken RPC failed"))
-        }
+        Err(status) => Err(anyhow::anyhow!(status).context("auth.v2.ClaimHubToken RPC failed")),
     }
 }
