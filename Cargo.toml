@@ -27,7 +27,7 @@ tokio = { version = "1.48", features = ["rt", "macros", "time", "net", "sync"] }
 
 tonic = { version = "0.14.5", features = ["transport"] }
 prost = "0.14.3"
-protos-rust = { git = "https://github.com/harvesthub-gardening-tool/protos-rust", rev = "f2dc4ca24da31612e75986ae119129fbeb130c30" }
+protos-rust = { git = "https://github.com/harvesthub-gardening-tool/protos-rust", rev = "f6dd21aa91c644e76064375a2c9f96938d893566" }
 
 [features]
 default = []
