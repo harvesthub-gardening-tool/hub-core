@@ -1,12 +1,15 @@
+mod auth;
 mod ble;
 mod config;
 mod grpc;
+mod persist;
 mod time;
 mod wifi;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use esp_idf_svc::hal::task::block_on;
 use esp_idf_svc::log::EspLogger;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{error, info, warn};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -14,7 +17,7 @@ use std::time::Duration;
 
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
-const HUB_NODE_ID: &str = env!("HUB_NODE_ID");
+const API_URL: &str = env!("API_URL");
 
 const SCAN_WAIT_SECONDS: u64 = 30;
 const UPLINK_THREAD_STACK: usize = 32 * 1024;
@@ -35,13 +38,21 @@ fn main() -> Result<()> {
 
     let _eventfs = esp_idf_svc::io::vfs::MountedEventfs::mount(5)?;
 
-    let mut wifi = wifi::init()?;
+    // NVS partition is one-shot; take it here and clone for every consumer.
+    let nvs = EspDefaultNvsPartition::take().context("take default NVS partition")?;
+
+    let mut wifi = wifi::init(nvs.clone())?;
     wifi::connect(WIFI_SSID, WIFI_PASSWORD, &mut wifi)?;
 
     let _sntp = time::get_sync_sntp()?;
 
+    // Resolve hub identity + JWT. Order matters: `esp_fill_random` (used inside
+    // `persist::load_or_generate_creds`) only emits CSPRNG-quality output once
+    // Wi-Fi has been started, which is guaranteed by the calls above.
+    let (device_id, jwt) = provision_hub(nvs.clone())?;
+
     let (tx, rx) = mpsc::sync_channel::<SensorReading>(UPLINK_QUEUE_DEPTH);
-    spawn_uplink_worker(rx)?;
+    spawn_uplink_worker(rx, jwt)?;
 
     let ble_device = ble::init_device();
     info!("BLE device ready");
@@ -62,7 +73,7 @@ fn main() -> Result<()> {
         {
             let now_ms = unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) as i64 } * 1000;
             let fake = SensorReading {
-                node_id: HUB_NODE_ID.to_string(),
+                node_id: device_id.clone(),
                 temperature_c: 21.5,
                 humidity_pct: 48.0,
                 soil_moisture_pct: 33.3,
@@ -95,7 +106,7 @@ fn main() -> Result<()> {
                     );
 
                     let msg = SensorReading {
-                        node_id: HUB_NODE_ID.to_string(),
+                        node_id: device_id.clone(),
                         temperature_c: reading.temperature_c,
                         humidity_pct: reading.humidity_pct,
                         soil_moisture_pct: 0.0,
@@ -133,19 +144,52 @@ fn main() -> Result<()> {
     }
 }
 
-fn spawn_uplink_worker(rx: Receiver<SensorReading>) -> Result<()> {
+fn provision_hub(nvs: EspDefaultNvsPartition) -> Result<(String, String)> {
+    let (device_id, hub_secret) = persist::load_or_generate_creds(nvs.clone())?;
+
+    if let Some(dev_token) = option_env!("HUB_TOKEN") {
+        persist::seed_jwt_from_env(nvs.clone(), dev_token)?;
+        info!("using HUB_TOKEN dev override (skipping ClaimHubToken)");
+        return Ok((device_id, dev_token.to_string()));
+    }
+
+    info!(
+        "\n=== HUB QR PAYLOAD ===\ndevice_id={device_id}\nhub_secret={hub_secret}\n======================\n"
+    );
+
+    if let Some(jwt) = persist::read_hub_jwt(nvs.clone())? {
+        info!("hub JWT loaded from NVS");
+        return Ok((device_id, jwt));
+    }
+
+    info!("no JWT persisted; calling auth.v2.ClaimHubToken");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for ClaimHubToken")?;
+
+    let jwt = rt
+        .block_on(auth::claim_hub_token(API_URL, &device_id, &hub_secret))
+        .context("ClaimHubToken failed")?;
+
+    persist::write_hub_jwt(nvs, &jwt)?;
+    info!("hub JWT obtained and persisted");
+    Ok((device_id, jwt))
+}
+
+fn spawn_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
     thread::Builder::new()
         .name("uplink".into())
         .stack_size(UPLINK_THREAD_STACK)
         .spawn(move || {
-            if let Err(e) = run_uplink_worker(rx) {
+            if let Err(e) = run_uplink_worker(rx, jwt) {
                 error!("uplink worker terminated: {e:#}");
             }
         })?;
     Ok(())
 }
 
-fn run_uplink_worker(rx: Receiver<SensorReading>) -> Result<()> {
+fn run_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -156,7 +200,7 @@ fn run_uplink_worker(rx: Receiver<SensorReading>) -> Result<()> {
 
         while let Ok(reading) = rx.recv() {
             if client.is_none() {
-                match grpc::HubClient::connect().await {
+                match grpc::HubClient::connect_with_token(&jwt).await {
                     Ok(c) => {
                         info!("gRPC client connected");
                         client = Some(c);

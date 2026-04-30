@@ -23,5 +23,10 @@ WIFI_SSID = "your-wifi-ssid"
 WIFI_PASSWORD = "your-wifi-password"
 
 API_URL = "http://harvest-hub-api.grimmely.com"
-API_TOKEN = "paste-long-lived-hub-jwt-here"
-HUB_NODE_ID = "esp32s3-garden-hub-1"
+
+# Optional dev override: bypass first-boot QR/AssociateHub/ClaimHubToken flow by
+# pre-seeding NVS with a hub JWT minted directly against the backend. Leave
+# unset for production; in production the hub generates its own device_id and
+# hub_secret on first boot, prints them to serial as a QR payload, and exchanges
+# them for a JWT via auth.v2.ClaimHubToken after the user calls AssociateHub.
+# HUB_TOKEN = "paste-dev-only-hub-jwt-here"

@@ -125,7 +125,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1083,15 +1083,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1415,7 +1406,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -1423,8 +1414,8 @@ dependencies = [
 
 [[package]]
 name = "protos-rust"
-version = "0.0.0-fefefbe"
-source = "git+https://github.com/harvesthub-gardening-tool/protos-rust#b7e716d271b419ed99b4b2954198bbae2bfcdfc2"
+version = "0.0.0-fecd30c"
+source = "git+https://github.com/harvesthub-gardening-tool/protos-rust?rev=b274c2e3c36bfaa3770fa16df552640728a1d47a#b274c2e3c36bfaa3770fa16df552640728a1d47a"
 dependencies = [
  "prost",
  "tonic",
