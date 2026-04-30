@@ -26,9 +26,11 @@ const UPLINK_QUEUE_DEPTH: usize = 16;
 #[derive(Debug, Clone)]
 struct SensorReading {
     node_id: String,
-    temperature_c: f64,
-    humidity_pct: f64,
-    soil_moisture_pct: f64,
+    air_temperature_c: f64,
+    air_pressure_pa: f64,
+    air_humidity_pct: f64,
+    soil_temperature_c: f64,
+    soil_humidity_pct: f64,
     timestamp_unix: i64,
 }
 
@@ -74,9 +76,11 @@ fn main() -> Result<()> {
             let now_ms = unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) as i64 } * 1000;
             let fake = SensorReading {
                 node_id: device_id.clone(),
-                temperature_c: 21.5,
-                humidity_pct: 48.0,
-                soil_moisture_pct: 33.3,
+                air_temperature_c: 21.5,
+                air_pressure_pa: 101_325.0,
+                air_humidity_pct: 48.0,
+                soil_temperature_c: 18.7,
+                soil_humidity_pct: 33.3,
                 timestamp_unix: now_ms,
             };
             info!("[fake-probe] injecting synthetic reading ts_ms={now_ms}");
@@ -95,21 +99,26 @@ fn main() -> Result<()> {
             match block_on(ble::read_probe_from_device(&ble_device, &candidate.device)) {
                 Ok(Some(reading)) => {
                     info!(
-                        "probe reading: addr={:?} name='{}' version={}.{} temp={:.2}°C hum={:.2}% ts={}",
+                        "probe reading: addr={:?} name='{}' version={}.{} air_temp={:.2}°C air_pressure={:.0}Pa air_hum={:.2}% soil_temp={:.2}°C soil_hum={:.2}% ts={}",
                         candidate.device.addr(),
                         candidate.meta.name,
                         candidate.meta.version_major,
                         candidate.meta.version_minor,
-                        reading.temperature_c,
-                        reading.humidity_pct,
+                        reading.air_temperature_c,
+                        reading.air_pressure_pa,
+                        reading.air_humidity_pct,
+                        reading.soil_temperature_c,
+                        reading.soil_humidity_pct,
                         reading.timestamp
                     );
 
                     let msg = SensorReading {
                         node_id: device_id.clone(),
-                        temperature_c: reading.temperature_c,
-                        humidity_pct: reading.humidity_pct,
-                        soil_moisture_pct: 0.0,
+                        air_temperature_c: reading.air_temperature_c,
+                        air_pressure_pa: reading.air_pressure_pa,
+                        air_humidity_pct: reading.air_humidity_pct,
+                        soil_temperature_c: reading.soil_temperature_c,
+                        soil_humidity_pct: reading.soil_humidity_pct,
                         timestamp_unix: reading.timestamp,
                     };
                     if let Err(e) = tx.try_send(msg) {
@@ -216,18 +225,23 @@ fn run_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
             match c
                 .send_data(
                     &reading.node_id,
-                    reading.temperature_c,
-                    reading.humidity_pct,
-                    reading.soil_moisture_pct,
+                    reading.air_temperature_c,
+                    reading.air_pressure_pa,
+                    reading.air_humidity_pct,
+                    reading.soil_temperature_c,
+                    reading.soil_humidity_pct,
                     reading.timestamp_unix,
                 )
                 .await
             {
                 Ok(()) => info!(
-                    "uplink ok: node={} temp={:.2} hum={:.2} ts={}",
+                    "uplink ok: node={} air_temp={:.2} air_pressure={:.0} air_hum={:.2} soil_temp={:.2} soil_hum={:.2} ts={}",
                     reading.node_id,
-                    reading.temperature_c,
-                    reading.humidity_pct,
+                    reading.air_temperature_c,
+                    reading.air_pressure_pa,
+                    reading.air_humidity_pct,
+                    reading.soil_temperature_c,
+                    reading.soil_humidity_pct,
                     reading.timestamp_unix
                 ),
                 Err(e) => {

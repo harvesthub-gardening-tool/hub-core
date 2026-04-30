@@ -1,5 +1,7 @@
 use crate::config::{
-    COMPANY_ID, ENVIRONMENTAL_SENSING_SERVICE_UUID, HUM_CHAR_UUID, MAGIC_MARKER, TEMP_CHAR_UUID,
+    AIR_HUM_CHAR_UUID, AIR_PRESSURE_CHAR_UUID, AIR_TEMP_CHAR_UUID, COMPANY_ID,
+    ENVIRONMENTAL_SENSING_SERVICE_UUID, LEGACY_TEST_MARKER, MAGIC_MARKER, SOIL_HUM_CHAR_UUID,
+    SOIL_TEMP_CHAR_UUID,
 };
 use crate::time;
 use anyhow::{bail, Context};
@@ -11,8 +13,11 @@ const BLE_SCAN_MS: u64 = 8_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProbeReading {
-    pub(crate) temperature_c: f64,
-    pub(crate) humidity_pct: f64,
+    pub(crate) air_temperature_c: f64,
+    pub(crate) air_pressure_pa: f64,
+    pub(crate) air_humidity_pct: f64,
+    pub(crate) soil_temperature_c: f64,
+    pub(crate) soil_humidity_pct: f64,
     pub(crate) timestamp: i64,
 }
 
@@ -123,36 +128,90 @@ pub(crate) async fn read_probe_from_device(
         }
     };
 
-    let temp_raw = match service.get_characteristic(uuid128!(TEMP_CHAR_UUID)).await {
-        Ok(temp_chr) => temp_chr
+    let air_temp_raw = match service
+        .get_characteristic(uuid128!(AIR_TEMP_CHAR_UUID))
+        .await
+    {
+        Ok(chr) => chr
             .read_value()
             .await
-            .context("temperature read failed")?,
+            .context("air temperature read failed")?,
         Err(_) => {
             let _ = client.disconnect();
             return Ok(None);
         }
     };
 
-    let hum_raw = match service.get_characteristic(uuid128!(HUM_CHAR_UUID)).await {
-        Ok(hum_chr) => hum_chr.read_value().await.context("humidity read failed")?,
+    let air_pressure_raw = match service
+        .get_characteristic(uuid128!(AIR_PRESSURE_CHAR_UUID))
+        .await
+    {
+        Ok(chr) => chr.read_value().await.context("air pressure read failed")?,
         Err(_) => {
             let _ = client.disconnect();
             return Ok(None);
         }
     };
 
-    info!("raw temp bytes={:02X?}", temp_raw);
-    info!("raw hum bytes={:02X?}", hum_raw);
+    let air_hum_raw = match service
+        .get_characteristic(uuid128!(AIR_HUM_CHAR_UUID))
+        .await
+    {
+        Ok(chr) => chr.read_value().await.context("air humidity read failed")?,
+        Err(_) => {
+            let _ = client.disconnect();
+            return Ok(None);
+        }
+    };
 
-    let temperature_c = parse_temperature_c(&temp_raw)?;
-    let humidity_pct = parse_humidity_pct(&hum_raw)?;
+    let soil_temp_raw = match service
+        .get_characteristic(uuid128!(SOIL_TEMP_CHAR_UUID))
+        .await
+    {
+        Ok(chr) => chr
+            .read_value()
+            .await
+            .context("soil temperature read failed")?,
+        Err(_) => {
+            let _ = client.disconnect();
+            return Ok(None);
+        }
+    };
+
+    let soil_hum_raw = match service
+        .get_characteristic(uuid128!(SOIL_HUM_CHAR_UUID))
+        .await
+    {
+        Ok(chr) => chr
+            .read_value()
+            .await
+            .context("soil humidity read failed")?,
+        Err(_) => {
+            let _ = client.disconnect();
+            return Ok(None);
+        }
+    };
+
+    info!("raw air temp bytes={:02X?}", air_temp_raw);
+    info!("raw air pressure bytes={:02X?}", air_pressure_raw);
+    info!("raw air hum bytes={:02X?}", air_hum_raw);
+    info!("raw soil temp bytes={:02X?}", soil_temp_raw);
+    info!("raw soil hum bytes={:02X?}", soil_hum_raw);
+
+    let air_temperature_c = parse_centi_celsius_i16(&air_temp_raw, "air temperature")?;
+    let air_pressure_pa = parse_pressure_pa(&air_pressure_raw)?;
+    let air_humidity_pct = parse_centi_percent_u16(&air_hum_raw, "air humidity")?;
+    let soil_temperature_c = parse_centi_celsius_i16(&soil_temp_raw, "soil temperature")?;
+    let soil_humidity_pct = parse_centi_percent_u16(&soil_hum_raw, "soil humidity")?;
 
     let _ = client.disconnect();
 
     Ok(Some(ProbeReading {
-        temperature_c,
-        humidity_pct,
+        air_temperature_c,
+        air_pressure_pa,
+        air_humidity_pct,
+        soil_temperature_c,
+        soil_humidity_pct,
         timestamp: time::get_unix_now_ms(),
     }))
 }
@@ -162,15 +221,11 @@ fn parse_probe_meta(company_id: u16, payload: &[u8]) -> Option<ProbeMeta> {
         return None;
     }
 
-    if payload.len() < MAGIC_MARKER.len() + 3 {
+    let Some(marker_len) = matching_marker_len(payload) else {
         return None;
-    }
+    };
 
-    if !payload.starts_with(MAGIC_MARKER) {
-        return None;
-    }
-
-    let base = MAGIC_MARKER.len();
+    let base = marker_len;
     let version_major = payload[base];
     let version_minor = payload[base + 1];
     let name_len = payload[base + 2] as usize;
@@ -191,18 +246,39 @@ fn parse_probe_meta(company_id: u16, payload: &[u8]) -> Option<ProbeMeta> {
     })
 }
 
-fn parse_temperature_c(raw: &[u8]) -> anyhow::Result<f64> {
+fn matching_marker_len(payload: &[u8]) -> Option<usize> {
+    if payload.starts_with(MAGIC_MARKER) && payload.len() >= MAGIC_MARKER.len() + 3 {
+        return Some(MAGIC_MARKER.len());
+    }
+
+    if payload.starts_with(LEGACY_TEST_MARKER) && payload.len() >= LEGACY_TEST_MARKER.len() + 3 {
+        return Some(LEGACY_TEST_MARKER.len());
+    }
+
+    None
+}
+
+fn parse_centi_celsius_i16(raw: &[u8], label: &str) -> anyhow::Result<f64> {
     if raw.len() < 2 {
-        bail!("temperature payload too short: {:?}", raw);
+        bail!("{label} payload too short: {:?}", raw);
     }
 
     let value = i16::from_be_bytes([raw[0], raw[1]]);
     Ok(value as f64 / 100.0)
 }
 
-fn parse_humidity_pct(raw: &[u8]) -> anyhow::Result<f64> {
+fn parse_pressure_pa(raw: &[u8]) -> anyhow::Result<f64> {
+    if raw.len() < 4 {
+        bail!("air pressure payload too short: {:?}", raw);
+    }
+
+    let value = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    Ok(value as f64)
+}
+
+fn parse_centi_percent_u16(raw: &[u8], label: &str) -> anyhow::Result<f64> {
     if raw.len() < 2 {
-        bail!("humidity payload too short: {:?}", raw);
+        bail!("{label} payload too short: {:?}", raw);
     }
 
     let value = u16::from_be_bytes([raw[0], raw[1]]);
