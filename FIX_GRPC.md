@@ -189,8 +189,9 @@ stack does not build for `xtensa-esp32s3-espidf`.
 
 - New optional feature in `Cargo.toml`: `fake-probe = []`. Off by default.
 - When enabled, each BLE scan cycle injects one synthetic `SensorReading`
-  (constant temp / humidity / soil values, current timestamp) into the uplink
-  channel — same code path as a real probe reading.
+  (constant air temperature, air pressure, air humidity, soil temperature, soil
+  humidity, and current timestamp) into the uplink channel — same code path as a
+  real probe reading.
 
 ### Why
 
