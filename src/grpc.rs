@@ -46,18 +46,22 @@ impl HubClient {
     pub async fn send_data(
         &mut self,
         node_id: &str,
-        temperature: f64,
-        humidity: f64,
-        soil_moisture: f64,
+        air_temperature: f64,
+        air_pressure: f64,
+        air_humidity: f64,
+        soil_temperature: f64,
+        soil_humidity: f64,
         timestamp: i64,
     ) -> Result<()> {
         let resp = self
             .garden_client
             .insert_sensor_data(InsertSensorDataRequest {
                 node_id: node_id.to_string(),
-                temperature,
-                humidity,
-                soil_moisture,
+                air_temperature,
+                air_pressure,
+                air_humidity,
+                soil_temperature,
+                soil_humidity,
                 timestamp,
             })
             .await?
