@@ -1,24 +1,9 @@
-# Main task: Tokio runtime + tonic clients live here, needs significant headroom
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
+# Stack main augmenté pour WiFi + BLE
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
-# System event task (Wi-Fi/IP events)
-CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
-CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
-
-# Default for std::thread spawned without explicit stack_size; bumped for tokio worker
-CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=16384
-
-# lwIP: HTTP/2 needs more concurrent sockets than the default 4; bigger buffers reduce
-# fragmentation of TLS-sized frames (also helpful for h2 9-byte frame overhead).
-CONFIG_LWIP_MAX_SOCKETS=10
-CONFIG_LWIP_TCP_MSS=1436
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5744
-CONFIG_LWIP_TCP_WND_DEFAULT=5744
-
-# BLE (NimBLE)
-CONFIG_BT_ENABLED=y
-CONFIG_BT_BLE_ENABLED=y
-CONFIG_BT_BLUEDROID_ENABLED=n
+# NimBLE standard (pas d'advertising étendu)
 CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_EXT_ADV=y
-CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=7000
+CONFIG_BT_NIMBLE_EXT_ADV=n
+
+# Stack NimBLE host
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=5120

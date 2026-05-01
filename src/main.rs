@@ -1,21 +1,22 @@
 mod ble;
 mod config;
 mod grpc;
+mod nvs_store;
 mod time;
 mod wifi;
+mod wifi_prov;
 
 use anyhow::Result;
+use esp32_nimble::BLEDevice;
 use esp_idf_svc::hal::task::block_on;
 use esp_idf_svc::log::EspLogger;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{error, info, warn};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-const WIFI_SSID: &str = env!("WIFI_SSID");
-const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 const HUB_NODE_ID: &str = env!("HUB_NODE_ID");
-
 const SCAN_WAIT_SECONDS: u64 = 30;
 const UPLINK_THREAD_STACK: usize = 32 * 1024;
 const UPLINK_QUEUE_DEPTH: usize = 16;
@@ -35,16 +36,51 @@ fn main() -> Result<()> {
 
     let _eventfs = esp_idf_svc::io::vfs::MountedEventfs::mount(5)?;
 
-    let mut wifi = wifi::init()?;
-    wifi::connect(WIFI_SSID, WIFI_PASSWORD, &mut wifi)?;
+    let nvs_partition = EspDefaultNvsPartition::take()?;
+    let mut wifi = wifi::init(nvs_partition.clone())?;
 
+    // -----------------------------------------------------------------------
+    // Boot : credentials NVS → connexion directe, sinon provisioning BLE
+    // -----------------------------------------------------------------------
+    let wifi_creds = match nvs_store::load(nvs_partition.clone()) {
+        Some(creds) => {
+            info!(
+                "[BOOT] Credentials NVS trouvés : ssid='{}' → tentative connexion",
+                creds.ssid
+            );
+            match wifi::connect(&creds.ssid, &creds.password, &mut wifi) {
+                Ok(()) => {
+                    info!("[BOOT] WiFi connecté depuis NVS");
+                    creds
+                }
+                Err(e) => {
+                    warn!("[BOOT] Connexion NVS échouée ({e:#}) → provisioning BLE");
+                    let ble_device = BLEDevice::take();
+                    wifi_prov::run(ble_device, nvs_partition.clone(), &mut wifi)?
+                }
+            }
+        }
+        None => {
+            info!("[BOOT] Aucun credential en NVS → provisioning BLE");
+            let ble_device = BLEDevice::take();
+            wifi_prov::run(ble_device, nvs_partition.clone(), &mut wifi)?
+        }
+    };
+
+    info!("[BOOT] WiFi opérationnel sur ssid='{}'", wifi_creds.ssid);
+
+    // -----------------------------------------------------------------------
+    // SNTP + uplink gRPC
+    // -----------------------------------------------------------------------
     let _sntp = time::get_sync_sntp()?;
-
     let (tx, rx) = mpsc::sync_channel::<SensorReading>(UPLINK_QUEUE_DEPTH);
     spawn_uplink_worker(rx)?;
 
+    // -----------------------------------------------------------------------
+    // Boucle principale BLE scan sondes (inchangée)
+    // -----------------------------------------------------------------------
     let ble_device = ble::init_device();
-    info!("BLE device ready");
+    info!("[BOOT] BLE device ready");
 
     loop {
         let candidates = match block_on(ble::scan_probe_candidates(&ble_device)) {
@@ -93,7 +129,6 @@ fn main() -> Result<()> {
                         reading.humidity_pct,
                         reading.timestamp
                     );
-
                     let msg = SensorReading {
                         node_id: HUB_NODE_ID.to_string(),
                         temperature_c: reading.temperature_c,
@@ -105,26 +140,17 @@ fn main() -> Result<()> {
                         warn!("uplink queue full, dropping reading: {e}");
                     }
                 }
-                Ok(None) => {
-                    info!(
-                        "skip addr={:?} name='{}' version={}.{}: probe service/chars not readable",
-                        candidate.device.addr(),
-                        candidate.meta.name,
-                        candidate.meta.version_major,
-                        candidate.meta.version_minor
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "read failed for addr={:?} name='{}' version={}.{}: {e:#}",
-                        candidate.device.addr(),
-                        candidate.meta.name,
-                        candidate.meta.version_major,
-                        candidate.meta.version_minor
-                    );
-                }
+                Ok(None) => info!(
+                    "skip addr={:?} name='{}': probe service/chars not readable",
+                    candidate.device.addr(),
+                    candidate.meta.name,
+                ),
+                Err(e) => error!(
+                    "read failed for addr={:?} name='{}': {e:#}",
+                    candidate.device.addr(),
+                    candidate.meta.name,
+                ),
             }
-
             thread::sleep(Duration::from_millis(500));
         }
 
@@ -157,34 +183,23 @@ fn run_uplink_worker(rx: Receiver<SensorReading>) -> Result<()> {
         while let Ok(reading) = rx.recv() {
             if client.is_none() {
                 match grpc::HubClient::connect().await {
-                    Ok(c) => {
-                        info!("gRPC client connected");
-                        client = Some(c);
-                    }
-                    Err(e) => {
-                        error!("gRPC connect failed, dropping reading: {e:#}");
-                        continue;
-                    }
+                    Ok(c) => { info!("gRPC client connected"); client = Some(c); }
+                    Err(e) => { error!("gRPC connect failed, dropping reading: {e:#}"); continue; }
                 }
             }
 
             let c = client.as_mut().unwrap();
-            match c
-                .send_data(
-                    &reading.node_id,
-                    reading.temperature_c,
-                    reading.humidity_pct,
-                    reading.soil_moisture_pct,
-                    reading.timestamp_unix,
-                )
-                .await
-            {
+            match c.send_data(
+                &reading.node_id,
+                reading.temperature_c,
+                reading.humidity_pct,
+                reading.soil_moisture_pct,
+                reading.timestamp_unix,
+            ).await {
                 Ok(()) => info!(
                     "uplink ok: node={} temp={:.2} hum={:.2} ts={}",
-                    reading.node_id,
-                    reading.temperature_c,
-                    reading.humidity_pct,
-                    reading.timestamp_unix
+                    reading.node_id, reading.temperature_c,
+                    reading.humidity_pct, reading.timestamp_unix
                 ),
                 Err(e) => {
                     error!("uplink failed: {e:#}; dropping client to force reconnect");

@@ -1,3 +1,5 @@
+// src/wifi.rs
+
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -7,18 +9,22 @@ use log::{error, info};
 use std::thread;
 use std::time::Duration;
 
-pub fn init() -> Result<BlockingWifi<EspWifi<'static>>, EspError> {
+/// Initialise le WiFi en recevant la NVS partition déjà prise par main().
+/// Cela évite le double-take qui cause ESP_ERR_INVALID_STATE.
+pub fn init(
+    nvs_partition: EspDefaultNvsPartition,
+) -> Result<BlockingWifi<EspWifi<'static>>, EspError> {
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
-    let nvs = EspDefaultNvsPartition::take()?;
 
     let wifi = BlockingWifi::wrap(
-        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
+        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs_partition))?,
         sys_loop,
     )?;
 
     Ok(wifi)
 }
+
 pub fn connect(
     ssid: &str,
     password: &str,
