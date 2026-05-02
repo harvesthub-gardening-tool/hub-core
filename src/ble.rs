@@ -291,6 +291,18 @@ fn parse_centi_percent_u16(raw: &[u8], label: &str) -> anyhow::Result<f64> {
     }
 
     let value = u16::from_be_bytes([raw[0], raw[1]]);
+    if value == u16::MAX {
+        bail!("humidity payload is invalid sentinel: {:02X?}", raw);
+    }
+
+    if value > 10_000 {
+        bail!(
+            "humidity payload out of range (>100.00%): raw={:02X?} value={}",
+            raw,
+            value
+        );
+    }
+
     Ok(value as f64 / 100.0)
 }
 

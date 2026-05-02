@@ -22,6 +22,9 @@ const API_URL: &str = env!("API_URL");
 const SCAN_WAIT_SECONDS: u64 = 30;
 const UPLINK_THREAD_STACK: usize = 32 * 1024;
 const UPLINK_QUEUE_DEPTH: usize = 16;
+const GRPC_CONNECT_MAX_ATTEMPTS: u8 = 3;
+const GRPC_SEND_MAX_ATTEMPTS: u8 = 3;
+const GRPC_RETRY_BACKOFF_MS: u64 = 500;
 
 #[derive(Debug, Clone)]
 struct SensorReading {
@@ -211,34 +214,91 @@ fn run_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
         let mut client: Option<grpc::HubClient> = None;
 
         while let Ok(reading) = rx.recv() {
-            if client.is_none() {
-                match grpc::HubClient::connect_with_token(&jwt).await {
-                    Ok(c) => {
-                        info!("gRPC client connected");
-                        client = Some(c);
+            let mut delivered = false;
+
+            for send_attempt in 1..=GRPC_SEND_MAX_ATTEMPTS {
+                if client.is_none() {
+                    for connect_attempt in 1..=GRPC_CONNECT_MAX_ATTEMPTS {
+                        match grpc::HubClient::connect_with_token(&jwt).await {
+                            Ok(c) => {
+                                info!(
+                                    "gRPC client connected (attempt {}/{})",
+                                    connect_attempt,
+                                    GRPC_CONNECT_MAX_ATTEMPTS
+                                );
+                                client = Some(c);
+                                break;
+                            }
+                            Err(e) => {
+                                error!(
+                                    "gRPC connect attempt {}/{} failed: {e:#}",
+                                    connect_attempt,
+                                    GRPC_CONNECT_MAX_ATTEMPTS
+                                );
+                                if connect_attempt < GRPC_CONNECT_MAX_ATTEMPTS {
+                                    tokio::time::sleep(Duration::from_millis(GRPC_RETRY_BACKOFF_MS))
+                                        .await;
+                                }
+                            }
+                        }
                     }
-                    Err(e) => {
-                        error!("gRPC connect failed, dropping reading: {e:#}");
-                        continue;
+
+                    if client.is_none() {
+                        error!(
+                            "gRPC connect failed after {} attempts, dropping reading",
+                            GRPC_CONNECT_MAX_ATTEMPTS
+                        );
+                        break;
+                    }
+                }
+
+                if let Some(c) = client.as_mut() {
+                    match c
+                        .send_data(
+                            &reading.node_id,
+                            reading.air_temperature_c,
+                            reading.air_pressure_pa,
+                            reading.air_humidity_pct,
+                            reading.soil_temperature_c,
+                            reading.soil_humidity_pct,
+                            reading.timestamp_unix,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            info!(
+                                "uplink ok: node={} air_temp={:.2} air_pressure={:.0} air_hum={:.2} soil_temp={:.2} soil_hum={:.2} ts={}",
+                                reading.node_id,
+                                reading.air_temperature_c,
+                                reading.air_pressure_pa,
+                                reading.air_humidity_pct,
+                                reading.soil_temperature_c,
+                                reading.soil_humidity_pct,
+                                reading.timestamp_unix
+                            );
+                            delivered = true;
+                            break;
+                        }
+                        Err(e) => {
+                            error!(
+                                "uplink attempt {}/{} failed: {e:#}; dropping client to force reconnect",
+                                send_attempt,
+                                GRPC_SEND_MAX_ATTEMPTS
+                            );
+                            client = None;
+                            if send_attempt < GRPC_SEND_MAX_ATTEMPTS {
+                                tokio::time::sleep(Duration::from_millis(GRPC_RETRY_BACKOFF_MS))
+                                    .await;
+                            }
+                        }
                     }
                 }
             }
 
-            let c = client.as_mut().unwrap();
-            match c
-                .send_data(
-                    &reading.node_id,
-                    reading.air_temperature_c,
-                    reading.air_pressure_pa,
-                    reading.air_humidity_pct,
-                    reading.soil_temperature_c,
-                    reading.soil_humidity_pct,
-                    reading.timestamp_unix,
-                )
-                .await
-            {
-                Ok(()) => info!(
-                    "uplink ok: node={} air_temp={:.2} air_pressure={:.0} air_hum={:.2} soil_temp={:.2} soil_hum={:.2} ts={}",
+            if !delivered {
+                error!(
+                    "uplink failed after {} attempts, dropping reading: node={} air_temp={:.2} air_pressure={:.0} air_hum={:.2} soil_temp={:.2} soil_hum={:.2} ts={}",
+                    GRPC_SEND_MAX_ATTEMPTS,
                     reading.node_id,
                     reading.air_temperature_c,
                     reading.air_pressure_pa,
@@ -246,11 +306,7 @@ fn run_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
                     reading.soil_temperature_c,
                     reading.soil_humidity_pct,
                     reading.timestamp_unix
-                ),
-                Err(e) => {
-                    error!("uplink failed: {e:#}; dropping client to force reconnect");
-                    client = None;
-                }
+                );
             }
         }
     });
