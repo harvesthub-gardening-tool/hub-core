@@ -2,9 +2,11 @@ mod auth;
 mod ble;
 mod config;
 mod grpc;
+mod nvs_store;
 mod persist;
 mod time;
 mod wifi;
+mod wifi_prov;
 
 use anyhow::{Context, Result};
 use esp_idf_svc::hal::task::block_on;
@@ -15,8 +17,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-const WIFI_SSID: &str = env!("WIFI_SSID");
-const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 const API_URL: &str = env!("API_URL");
 
 const SCAN_WAIT_SECONDS: u64 = 30;
@@ -44,25 +44,51 @@ fn main() -> Result<()> {
     let _eventfs = esp_idf_svc::io::vfs::MountedEventfs::mount(5)?;
 
     // NVS partition is one-shot; take it here and clone for every consumer.
-    let nvs = EspDefaultNvsPartition::take().context("take default NVS partition")?;
+    let nvs_partition = EspDefaultNvsPartition::take().context("take default NVS partition")?;
+    let mut wifi = wifi::init(nvs_partition.clone())?;
 
-    let mut wifi = wifi::init(nvs.clone())?;
-    wifi::connect(WIFI_SSID, WIFI_PASSWORD, &mut wifi)?;
+    // BLEDevice::take() is a singleton — take it once so it can be reused
+    // for both BLE provisioning (if triggered) and the probe scan loop.
+    let ble_device = ble::init_device();
+
+    let wifi_creds = match nvs_store::load(nvs_partition.clone()) {
+        Some(creds) => {
+            info!(
+                "[BOOT] NVS credentials found: ssid='{}' → attempting connection",
+                creds.ssid
+            );
+            match wifi::connect(&creds.ssid, &creds.password, &mut wifi) {
+                Ok(()) => {
+                    info!("[BOOT] WiFi connected from NVS");
+                    creds
+                }
+                Err(e) => {
+                    warn!("[BOOT] NVS connection failed ({e:#}) → BLE provisioning");
+                    wifi_prov::run(ble_device, nvs_partition.clone(), &mut wifi)?
+                }
+            }
+        }
+        None => {
+            info!("[BOOT] No NVS credentials → BLE provisioning");
+            wifi_prov::run(ble_device, nvs_partition.clone(), &mut wifi)?
+        }
+    };
+
+    info!("[BOOT] WiFi operational on ssid='{}'", wifi_creds.ssid);
 
     let _sntp = time::get_sync_sntp()?;
 
     // Resolve hub identity + JWT. Order matters: `esp_fill_random` (used inside
     // `persist::load_or_generate_creds`) only emits CSPRNG-quality output once
     // Wi-Fi has been started, which is guaranteed by the calls above.
-    let (hub_device_id, jwt) = provision_hub(nvs.clone())?;
+    let (hub_device_id, jwt) = provision_hub(nvs_partition.clone())?;
     #[cfg(not(feature = "fake-probe"))]
     drop(hub_device_id);
 
     let (tx, rx) = mpsc::sync_channel::<SensorReading>(UPLINK_QUEUE_DEPTH);
     spawn_uplink_worker(rx, jwt)?;
 
-    let ble_device = ble::init_device();
-    info!("BLE device ready");
+    info!("[BOOT] BLE device ready");
 
     loop {
         let candidates = match block_on(ble::scan_probe_candidates(ble_device)) {
@@ -117,7 +143,6 @@ fn main() -> Result<()> {
                         reading.soil_humidity_pct,
                         reading.timestamp
                     );
-
                     let msg = SensorReading {
                         node_id: reading.probe_uuid.clone(),
                         air_temperature_c: reading.air_temperature_c,
@@ -131,26 +156,17 @@ fn main() -> Result<()> {
                         warn!("uplink queue full, dropping reading: {e}");
                     }
                 }
-                Ok(None) => {
-                    info!(
-                        "skip addr={:?} name='{}' version={}.{}: probe service/chars not readable",
-                        candidate.device.addr(),
-                        candidate.meta.name,
-                        candidate.meta.version_major,
-                        candidate.meta.version_minor
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "read failed for addr={:?} name='{}' version={}.{}: {e:#}",
-                        candidate.device.addr(),
-                        candidate.meta.name,
-                        candidate.meta.version_major,
-                        candidate.meta.version_minor
-                    );
-                }
+                Ok(None) => info!(
+                    "skip addr={:?} name='{}': probe service/chars not readable",
+                    candidate.device.addr(),
+                    candidate.meta.name,
+                ),
+                Err(e) => error!(
+                    "read failed for addr={:?} name='{}': {e:#}",
+                    candidate.device.addr(),
+                    candidate.meta.name,
+                ),
             }
-
             thread::sleep(Duration::from_millis(500));
         }
 

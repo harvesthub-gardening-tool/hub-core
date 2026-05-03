@@ -19,9 +19,6 @@ ESP_IDF_PATH_ISSUES = "warn"
 # Required for now due to embuild limitations.
 #CARGO_WORKSPACE_DIR = { value = "", relative = true }
 
-WIFI_SSID = "your-wifi-ssid"
-WIFI_PASSWORD = "your-wifi-password"
-
 API_URL = "http://harvest-hub-api.grimmely.com"
 
 # Optional dev override: bypass first-boot QR/AssociateHub/ClaimHubToken flow by

@@ -11,17 +11,20 @@ use std::time::Duration;
 // (Wi-Fi calibration storage + hub-token persistence). Passing it in
 // avoids the one-shot `EspDefaultNvsPartition::take()` failing on the
 // second caller.
-pub fn init(nvs: EspDefaultNvsPartition) -> Result<BlockingWifi<EspWifi<'static>>, EspError> {
+pub fn init(
+    nvs_partition: EspDefaultNvsPartition,
+) -> Result<BlockingWifi<EspWifi<'static>>, EspError> {
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
 
     let wifi = BlockingWifi::wrap(
-        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
+        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs_partition))?,
         sys_loop,
     )?;
 
     Ok(wifi)
 }
+
 pub fn connect(
     ssid: &str,
     password: &str,
