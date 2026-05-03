@@ -81,7 +81,7 @@ pub fn run(
         let mut adv = ble_advertising.lock();
         adv.set_data(
             BLEAdvertisementData::new()
-                .name("HarvestHub-Setup")
+                .name("HarvestHub-Dev")
                 .add_service_uuid(uuid128!(PROV_SERVICE_UUID)),
         )?;
         adv.start()?;

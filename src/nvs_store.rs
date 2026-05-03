@@ -41,15 +41,16 @@ pub fn load(nvs_partition: EspDefaultNvsPartition) -> Option<WifiCredentials> {
 }
 
 pub fn save(nvs_partition: EspDefaultNvsPartition, creds: &WifiCredentials) -> Result<()> {
-    let mut nvs = open_nvs(nvs_partition)?;
+    let nvs = open_nvs(nvs_partition)?;
     nvs.set_str(KEY_SSID, &creds.ssid)?;
     nvs.set_str(KEY_PASS, &creds.password)?;
     info!("[NVS] Credentials sauvegardés : ssid='{}'", creds.ssid);
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn clear(nvs_partition: EspDefaultNvsPartition) -> Result<()> {
-    let mut nvs = open_nvs(nvs_partition)?;
+    let nvs = open_nvs(nvs_partition)?;
     let _ = nvs.remove(KEY_SSID);
     let _ = nvs.remove(KEY_PASS);
     info!("[NVS] Credentials effacés");
