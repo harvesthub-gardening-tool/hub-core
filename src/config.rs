@@ -1,5 +1,7 @@
 pub const COMPANY_ID: u16 = 0x1234;
 pub const MAGIC_MARKER: &[u8] = b"HH-PROBE";
+pub const SETUP_MARKER: &[u8] = b"HH-SETUP";
+pub const SETUP_PROBE_NAME: &str = "HH-PROBE-SETUP";
 pub const LEGACY_TEST_MARKER: &[u8] = b"TEST";
 
 // Environmental Sensing
@@ -13,3 +15,5 @@ pub const AIR_HUM_CHAR_UUID: &str = "00002a6f-0000-1000-8000-00805f9b34fb";
 pub const PROBE_UUID_CHAR_UUID: &str = "12340002-0000-1000-8000-00805f9b34fb";
 pub const SOIL_TEMP_CHAR_UUID: &str = "12340003-0000-1000-8000-00805f9b34fb";
 pub const SOIL_HUM_CHAR_UUID: &str = "12340004-0000-1000-8000-00805f9b34fb";
+pub const PROBE_SETUP_CONFIRM_CHAR_UUID: &str = "12340005-0000-1000-8000-00805f9b34fb";
+pub const PROBE_SETUP_CONFIRM_MAGIC: &[u8] = b"HHSETUP1";

@@ -1,4 +1,4 @@
-# Main task: Tokio runtime + tonic clients live here, needs significant headroom
+# Main task: Tokio runtime + tonic gRPC clients + BLE provisioning need headroom
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 
 # System event task (Wi-Fi/IP events)
@@ -15,10 +15,14 @@ CONFIG_LWIP_TCP_MSS=1436
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5744
 CONFIG_LWIP_TCP_WND_DEFAULT=5744
 
-# BLE (NimBLE)
+# BLE (NimBLE) — BT_ENABLED is the parent gate; without it esp-idf-sys generates no NimBLE symbols
 CONFIG_BT_ENABLED=y
 CONFIG_BT_BLE_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_EXT_ADV=y
+
+# Standard advertising only (no BLE 5.0 extended ADV); wifi_prov and probe scan both use legacy ADV
+CONFIG_BT_NIMBLE_EXT_ADV=n
+
+# Larger NimBLE host stack — GATT server (wifi_prov) needs more headroom than scan-only
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=7000
