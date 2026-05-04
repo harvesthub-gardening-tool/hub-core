@@ -30,6 +30,23 @@ pub fn connect(
     password: &str,
     wifi: &mut BlockingWifi<EspWifi<'static>>,
 ) -> anyhow::Result<()> {
+    connect_with_attempts(ssid, password, wifi, 5)
+}
+
+pub fn connect_for_provisioning(
+    ssid: &str,
+    password: &str,
+    wifi: &mut BlockingWifi<EspWifi<'static>>,
+) -> anyhow::Result<()> {
+    connect_with_attempts(ssid, password, wifi, 1)
+}
+
+fn connect_with_attempts(
+    ssid: &str,
+    password: &str,
+    wifi: &mut BlockingWifi<EspWifi<'static>>,
+    max_attempts: u8,
+) -> anyhow::Result<()> {
     let wifi_configuration = Configuration::Client(ClientConfiguration {
         ssid: ssid.try_into()?,
         password: password.try_into()?,
@@ -52,12 +69,14 @@ pub fn connect(
 
     let found = ap_infos.iter().any(|ap| ap.ssid.as_str() == ssid);
     if !found {
+        let _ = wifi.disconnect();
+        let _ = wifi.stop();
         anyhow::bail!("Configured SSID '{}' not found in scan", ssid);
     }
 
     let mut last_err = None;
 
-    for attempt in 1..=5 {
+    for attempt in 1..=max_attempts {
         info!("Connecting to SSID '{}' (attempt {})", ssid, attempt);
 
         match wifi.connect() {
@@ -73,11 +92,16 @@ pub fn connect(
             }
             Err(e) => {
                 error!("Wi-Fi connect attempt {} failed: {:?}", attempt, e);
+                let _ = wifi.disconnect();
                 last_err = Some(e);
-                thread::sleep(Duration::from_secs(3));
+                if attempt < max_attempts {
+                    thread::sleep(Duration::from_secs(3));
+                }
             }
         }
     }
 
+    let _ = wifi.disconnect();
+    let _ = wifi.stop();
     Err(last_err.unwrap().into())
 }

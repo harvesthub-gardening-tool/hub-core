@@ -13,6 +13,20 @@ cargo +esp check
 cargo +esp run
 ````
 
+During `cargo +esp check` / `cargo +esp run`, the build script prints the hub
+identity and a ready-to-open setup URI:
+
+```text
+warning: probe-grpc@0.1.0: HarvestHub setup hub_uuid=...
+warning: probe-grpc@0.1.0: HarvestHub setup hub_secret=...
+warning: probe-grpc@0.1.0: HarvestHub setup uri=harvesthub://hub-setup?hub_uuid=...&hub_secret=...&hub_name=HarvestHub-Dev
+```
+
+The generated identity is stored at `target/harvesthub-dev-identity.env` and is
+embedded into the flashed firmware, then seeded into NVS on first boot. Delete
+that file to generate a new identity, or set `HUB_DEVICE_ID`, `HUB_SECRET`, and
+optionally `HUB_NAME` before building to force specific values.
+
 - ESP
 ```
 espflash erase-flash --chip esp32s3

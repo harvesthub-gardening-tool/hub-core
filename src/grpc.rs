@@ -27,6 +27,16 @@ pub struct HubClient {
     garden_client: GardenServiceClient<InterceptedService<Channel, AuthInterceptor>>,
 }
 
+pub struct SensorData<'a> {
+    pub node_id: &'a str,
+    pub air_temperature: f64,
+    pub air_pressure: f64,
+    pub air_humidity: f64,
+    pub soil_temperature: f64,
+    pub soil_humidity: f64,
+    pub timestamp: i64,
+}
+
 impl HubClient {
     pub async fn connect_with_token(token: &str) -> Result<Self> {
         let channel = Endpoint::from_static(API_URL)
@@ -43,26 +53,17 @@ impl HubClient {
         Ok(Self { garden_client })
     }
 
-    pub async fn send_data(
-        &mut self,
-        node_id: &str,
-        air_temperature: f64,
-        air_pressure: f64,
-        air_humidity: f64,
-        soil_temperature: f64,
-        soil_humidity: f64,
-        timestamp: i64,
-    ) -> Result<()> {
+    pub async fn send_data(&mut self, data: SensorData<'_>) -> Result<()> {
         let resp = self
             .garden_client
             .insert_sensor_data(InsertSensorDataRequest {
-                node_id: node_id.to_string(),
-                air_temperature,
-                air_pressure,
-                air_humidity,
-                soil_temperature,
-                soil_humidity,
-                timestamp,
+                node_id: data.node_id.to_string(),
+                air_temperature: data.air_temperature,
+                air_pressure: data.air_pressure,
+                air_humidity: data.air_humidity,
+                soil_temperature: data.soil_temperature,
+                soil_humidity: data.soil_humidity,
+                timestamp: data.timestamp,
             })
             .await?
             .into_inner();

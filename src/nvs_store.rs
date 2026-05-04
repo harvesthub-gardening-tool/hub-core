@@ -37,7 +37,10 @@ pub fn load(nvs_partition: EspDefaultNvsPartition) -> Option<WifiCredentials> {
     }
 
     info!("[NVS] Credentials chargés : ssid='{}'", ssid);
-    Some(WifiCredentials { ssid, password: pass })
+    Some(WifiCredentials {
+        ssid,
+        password: pass,
+    })
 }
 
 pub fn save(nvs_partition: EspDefaultNvsPartition, creds: &WifiCredentials) -> Result<()> {

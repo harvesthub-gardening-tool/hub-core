@@ -18,6 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 const API_URL: &str = env!("API_URL");
+const HUB_NAME: &str = env!("HUB_NAME");
 
 const SCAN_WAIT_SECONDS: u64 = 30;
 const UPLINK_THREAD_STACK: usize = 32 * 1024;
@@ -51,6 +52,8 @@ fn main() -> Result<()> {
     // for both BLE provisioning (if triggered) and the probe scan loop.
     let ble_device = ble::init_device();
 
+    let mut claimed_hub_identity: Option<(String, String)> = None;
+
     let wifi_creds = match nvs_store::load(nvs_partition.clone()) {
         Some(creds) => {
             info!(
@@ -64,24 +67,36 @@ fn main() -> Result<()> {
                 }
                 Err(e) => {
                     warn!("[BOOT] NVS connection failed ({e:#}) → BLE provisioning");
-                    wifi_prov::run(ble_device, nvs_partition.clone(), &mut wifi)?
+                    let provisioned =
+                        wifi_prov::run(ble_device, nvs_partition.clone(), &mut wifi, || {
+                            claim_hub_after_time_sync(nvs_partition.clone())
+                        })?;
+                    log_setup_probes(&provisioned.setup_probes);
+                    claimed_hub_identity = Some((provisioned.hub_device_id, provisioned.jwt));
+                    provisioned.credentials
                 }
             }
         }
         None => {
             info!("[BOOT] No NVS credentials → BLE provisioning");
-            wifi_prov::run(ble_device, nvs_partition.clone(), &mut wifi)?
+            let provisioned = wifi_prov::run(ble_device, nvs_partition.clone(), &mut wifi, || {
+                claim_hub_after_time_sync(nvs_partition.clone())
+            })?;
+            log_setup_probes(&provisioned.setup_probes);
+            claimed_hub_identity = Some((provisioned.hub_device_id, provisioned.jwt));
+            provisioned.credentials
         }
     };
 
     info!("[BOOT] WiFi operational on ssid='{}'", wifi_creds.ssid);
 
-    let _sntp = time::get_sync_sntp()?;
-
     // Resolve hub identity + JWT. Order matters: `esp_fill_random` (used inside
     // `persist::load_or_generate_creds`) only emits CSPRNG-quality output once
     // Wi-Fi has been started, which is guaranteed by the calls above.
-    let (hub_device_id, jwt) = provision_hub(nvs_partition.clone())?;
+    let (hub_device_id, jwt) = match claimed_hub_identity {
+        Some(identity) => identity,
+        None => claim_hub_after_time_sync(nvs_partition.clone())?,
+    };
     #[cfg(not(feature = "fake-probe"))]
     drop(hub_device_id);
 
@@ -127,6 +142,25 @@ fn main() -> Result<()> {
         }
 
         for candidate in &candidates {
+            if matches!(candidate.meta.mode, ble::ProbeMode::Setup) {
+                match block_on(ble::acknowledge_setup_probe(ble_device, &candidate.device)) {
+                    Ok(()) => info!(
+                        "setup probe acknowledged: addr={:?} name='{}' version={}.{}",
+                        candidate.device.addr(),
+                        candidate.meta.name,
+                        candidate.meta.version_major,
+                        candidate.meta.version_minor,
+                    ),
+                    Err(e) => error!(
+                        "setup probe acknowledge failed for addr={:?} name='{}': {e:#}",
+                        candidate.device.addr(),
+                        candidate.meta.name,
+                    ),
+                }
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+
             match block_on(ble::read_probe_from_device(ble_device, &candidate.device)) {
                 Ok(Some(reading)) => {
                     info!(
@@ -175,6 +209,20 @@ fn main() -> Result<()> {
     }
 }
 
+fn log_setup_probes(probes: &[ble::SetupProbe]) {
+    if probes.is_empty() {
+        info!("[PROV] No setup probes picked up during provisioning");
+        return;
+    }
+
+    for probe in probes {
+        info!(
+            "[PROV] Setup probe picked up: uuid={} name='{}' version={}.{}",
+            probe.probe_uuid, probe.name, probe.version_major, probe.version_minor,
+        );
+    }
+}
+
 fn provision_hub(nvs: EspDefaultNvsPartition) -> Result<(String, String)> {
     let (device_id, hub_secret) = persist::load_or_generate_creds(nvs.clone())?;
 
@@ -185,7 +233,8 @@ fn provision_hub(nvs: EspDefaultNvsPartition) -> Result<(String, String)> {
     }
 
     info!(
-        "\n=== HUB QR PAYLOAD ===\ndevice_id={device_id}\nhub_secret={hub_secret}\n======================\n"
+        "\n=== HUB QR PAYLOAD ===\ndevice_id={device_id}\nhub_secret={hub_secret}\nuri={}\n======================\n",
+        setup_uri(&device_id, &hub_secret),
     );
 
     if let Some(jwt) = persist::read_hub_jwt(nvs.clone())? {
@@ -206,6 +255,32 @@ fn provision_hub(nvs: EspDefaultNvsPartition) -> Result<(String, String)> {
     persist::write_hub_jwt(nvs, &jwt)?;
     info!("hub JWT obtained and persisted");
     Ok((device_id, jwt))
+}
+
+fn setup_uri(device_id: &str, hub_secret: &str) -> String {
+    format!(
+        "harvesthub://hub-setup?hub_uuid={device_id}&hub_secret={hub_secret}&hub_name={}",
+        encode_uri_component(HUB_NAME),
+    )
+}
+
+fn encode_uri_component(value: &str) -> String {
+    let mut encoded = String::new();
+
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+
+    encoded
+}
+
+fn claim_hub_after_time_sync(nvs: EspDefaultNvsPartition) -> Result<(String, String)> {
+    let _sntp = time::get_sync_sntp()?;
+    provision_hub(nvs)
 }
 
 fn spawn_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
@@ -270,15 +345,15 @@ fn run_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
 
                 if let Some(c) = client.as_mut() {
                     match c
-                        .send_data(
-                            &reading.node_id,
-                            reading.air_temperature_c,
-                            reading.air_pressure_pa,
-                            reading.air_humidity_pct,
-                            reading.soil_temperature_c,
-                            reading.soil_humidity_pct,
-                            reading.timestamp_unix,
-                        )
+                        .send_data(grpc::SensorData {
+                            node_id: &reading.node_id,
+                            air_temperature: reading.air_temperature_c,
+                            air_pressure: reading.air_pressure_pa,
+                            air_humidity: reading.air_humidity_pct,
+                            soil_temperature: reading.soil_temperature_c,
+                            soil_humidity: reading.soil_humidity_pct,
+                            timestamp: reading.timestamp_unix,
+                        })
                         .await
                     {
                         Ok(()) => {
