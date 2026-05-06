@@ -1347,6 +1347,7 @@ dependencies = [
  "protos-rust",
  "tokio",
  "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

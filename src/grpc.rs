@@ -1,11 +1,14 @@
 use anyhow::Result;
 use protos_rust::control::v1::{
-    control_service_client::ControlServiceClient, AckMotorCommandEventRequest, MotorCommand,
+    AckMotorCommandEventRequest, AckMotorCommandEventResponse, MotorCommand,
     MotorCommandReasonCode, MotorCommandStatus, PullPendingMotorCommandsRequest,
+    PullPendingMotorCommandsResponse,
 };
-use protos_rust::garden::v2::{
-    garden_service_client::GardenServiceClient, InsertSensorDataRequest,
-};
+use protos_rust::garden::v2::{InsertSensorDataRequest, InsertSensorDataResponse};
+use tonic::client::Grpc;
+use tonic::codec::{BufferSettings, Codec};
+use tonic::codegen::http::uri::PathAndQuery;
+use tonic::codegen::GrpcMethod;
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
@@ -17,6 +20,8 @@ const GRPC_CHANNEL_BUFFER_SIZE: usize = 8;
 const GRPC_CONCURRENCY_LIMIT: usize = 1;
 const GRPC_MAX_ENCODING_MESSAGE_SIZE: usize = 512;
 const GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 4096;
+const GRPC_CODEC_BUFFER_SIZE: usize = 256;
+const GRPC_CODEC_YIELD_THRESHOLD: usize = 1024;
 
 #[derive(Clone)]
 struct AuthInterceptor {
@@ -32,8 +37,7 @@ impl Interceptor for AuthInterceptor {
 }
 
 pub struct HubClient {
-    garden_client: GardenServiceClient<InterceptedService<Channel, AuthInterceptor>>,
-    control_client: ControlServiceClient<InterceptedService<Channel, AuthInterceptor>>,
+    grpc: Grpc<InterceptedService<Channel, AuthInterceptor>>,
 }
 
 pub struct SensorData<'a> {
@@ -59,31 +63,29 @@ impl HubClient {
         let metadata: MetadataValue<_> = format!("Bearer {}", token).parse()?;
         let interceptor = AuthInterceptor { token: metadata };
         let service = InterceptedService::new(channel, interceptor);
-        let garden_client = GardenServiceClient::new(service.clone())
-            .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE)
-            .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE);
-        let control_client = ControlServiceClient::new(service)
+        let grpc = Grpc::new(service)
             .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE)
             .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE);
 
-        Ok(Self {
-            garden_client,
-            control_client,
-        })
+        Ok(Self { grpc })
     }
 
     pub async fn send_data(&mut self, data: SensorData<'_>) -> Result<()> {
         let resp = self
-            .garden_client
-            .insert_sensor_data(InsertSensorDataRequest {
-                node_id: data.node_id.to_string(),
-                air_temperature: data.air_temperature,
-                air_pressure: data.air_pressure,
-                air_humidity: data.air_humidity,
-                soil_temperature: data.soil_temperature,
-                soil_humidity: data.soil_humidity,
-                timestamp: data.timestamp,
-            })
+            .unary::<InsertSensorDataRequest, InsertSensorDataResponse>(
+                InsertSensorDataRequest {
+                    node_id: data.node_id.to_string(),
+                    air_temperature: data.air_temperature,
+                    air_pressure: data.air_pressure,
+                    air_humidity: data.air_humidity,
+                    soil_temperature: data.soil_temperature,
+                    soil_humidity: data.soil_humidity,
+                    timestamp: data.timestamp,
+                },
+                "/garden.v2.GardenService/InsertSensorData",
+                "garden.v2.GardenService",
+                "InsertSensorData",
+            )
             .await?
             .into_inner();
 
@@ -100,12 +102,16 @@ impl HubClient {
         lease_duration_ms: i32,
     ) -> Result<Vec<MotorCommand>> {
         let resp = self
-            .control_client
-            .pull_pending_motor_commands(PullPendingMotorCommandsRequest {
-                hub_id: hub_id.to_string(),
-                max_commands,
-                lease_duration_ms,
-            })
+            .unary::<PullPendingMotorCommandsRequest, PullPendingMotorCommandsResponse>(
+                PullPendingMotorCommandsRequest {
+                    hub_id: hub_id.to_string(),
+                    max_commands,
+                    lease_duration_ms,
+                },
+                "/control.v1.ControlService/PullPendingMotorCommands",
+                "control.v1.ControlService",
+                "PullPendingMotorCommands",
+            )
             .await?
             .into_inner();
 
@@ -122,18 +128,91 @@ impl HubClient {
         reason_message: &str,
     ) -> Result<Option<MotorCommand>> {
         let resp = self
-            .control_client
-            .ack_motor_command_event(AckMotorCommandEventRequest {
-                command_id: command_id.to_string(),
-                hub_id: hub_id.to_string(),
-                node_id: node_id.to_string(),
-                status: status as i32,
-                reason_code: reason_code as i32,
-                reason_message: reason_message.to_string(),
-            })
+            .unary::<AckMotorCommandEventRequest, AckMotorCommandEventResponse>(
+                AckMotorCommandEventRequest {
+                    command_id: command_id.to_string(),
+                    hub_id: hub_id.to_string(),
+                    node_id: node_id.to_string(),
+                    status: status as i32,
+                    reason_code: reason_code as i32,
+                    reason_message: reason_message.to_string(),
+                },
+                "/control.v1.ControlService/AckMotorCommandEvent",
+                "control.v1.ControlService",
+                "AckMotorCommandEvent",
+            )
             .await?
             .into_inner();
 
         Ok(resp.command)
     }
+
+    async fn unary<Req, Resp>(
+        &mut self,
+        request: Req,
+        path: &'static str,
+        service_name: &'static str,
+        method_name: &'static str,
+    ) -> Result<tonic::Response<Resp>, Status>
+    where
+        Req: prost::Message + Send + Sync + 'static,
+        Resp: prost::Message + Default + Send + Sync + 'static,
+    {
+        self.grpc
+            .ready()
+            .await
+            .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {e}")))?;
+
+        let codec = small_buffer_codec::<Req, Resp>();
+        let path = PathAndQuery::from_static(path);
+        let mut req = Request::new(request);
+        req.extensions_mut()
+            .insert(GrpcMethod::new(service_name, method_name));
+
+        self.grpc.unary(req, path, codec).await
+    }
+}
+
+fn small_buffer_codec<Req, Resp>() -> SmallBufferProstCodec<Req, Resp>
+where
+    Req: prost::Message + Send + 'static,
+    Resp: prost::Message + Default + Send + 'static,
+{
+    SmallBufferProstCodec::default()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SmallBufferProstCodec<Req, Resp> {
+    _marker: core::marker::PhantomData<(Req, Resp)>,
+}
+
+impl<Req, Resp> Default for SmallBufferProstCodec<Req, Resp> {
+    fn default() -> Self {
+        Self {
+            _marker: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<Req, Resp> Codec for SmallBufferProstCodec<Req, Resp>
+where
+    Req: prost::Message + Send + 'static,
+    Resp: prost::Message + Default + Send + 'static,
+{
+    type Encode = Req;
+    type Decode = Resp;
+    type Encoder = <tonic_prost::ProstCodec<Req, Resp> as Codec>::Encoder;
+    type Decoder = <tonic_prost::ProstCodec<Req, Resp> as Codec>::Decoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        tonic_prost::ProstCodec::<Req, Resp>::raw_encoder(small_buffer_settings())
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        tonic_prost::ProstCodec::<Req, Resp>::raw_decoder(small_buffer_settings())
+    }
+}
+
+fn small_buffer_settings() -> BufferSettings {
+    BufferSettings::new(GRPC_CODEC_BUFFER_SIZE, GRPC_CODEC_YIELD_THRESHOLD)
 }

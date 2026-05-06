@@ -26,6 +26,7 @@ esp32-nimble = "0.12.0"
 tokio = { version = "1.48", features = ["rt", "macros", "time", "net", "sync"] }
 
 tonic = { version = "0.14.5", features = ["transport"] }
+tonic-prost = "0.14.5"
 prost = "0.14.3"
 protos-rust = { git = "https://github.com/harvesthub-gardening-tool/protos-rust", rev = "fc13d7f1e50594ca795e4b7fa15d648837eccbd6" }
 

@@ -280,7 +280,18 @@ fn run_with_radio_memory_gate<T>(
 fn log_heap(label: &str) {
     let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
     let min_free_heap = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() };
-    info!("[HEAP] {label}: free={free_heap} min_free={min_free_heap}");
+    let free_8bit =
+        unsafe { esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_8BIT) };
+    let largest_8bit = unsafe {
+        esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
+    };
+    let internal_caps = esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT;
+    let free_internal = unsafe { esp_idf_svc::sys::heap_caps_get_free_size(internal_caps) };
+    let largest_internal =
+        unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(internal_caps) };
+    info!(
+        "[HEAP] {label}: free={free_heap} min_free={min_free_heap} free_8bit={free_8bit} largest_8bit={largest_8bit} free_internal={free_internal} largest_internal={largest_internal}"
+    );
 }
 
 fn restart_after_successful_provisioning(provisioned: wifi_prov::ProvisionedHub) -> ! {
