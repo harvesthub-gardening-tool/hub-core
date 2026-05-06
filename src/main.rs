@@ -4,6 +4,7 @@ mod config;
 mod grpc;
 mod nvs_store;
 mod persist;
+mod polling;
 mod time;
 mod wifi;
 mod wifi_prov;
@@ -13,7 +14,7 @@ use esp_idf_svc::hal::task::block_on;
 use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{error, info, warn};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -26,6 +27,8 @@ const UPLINK_QUEUE_DEPTH: usize = 16;
 const GRPC_CONNECT_MAX_ATTEMPTS: u8 = 3;
 const GRPC_SEND_MAX_ATTEMPTS: u8 = 3;
 const GRPC_RETRY_BACKOFF_MS: u64 = 500;
+const MOTOR_DISPATCH_QUEUE_DEPTH: usize = 8;
+const MOTOR_DISPATCH_SLEEP_CHUNK_MS: u64 = 250;
 
 #[derive(Debug, Clone)]
 struct SensorReading {
@@ -97,20 +100,27 @@ fn main() -> Result<()> {
         Some(identity) => identity,
         None => claim_hub_after_time_sync(nvs_partition.clone())?,
     };
-    #[cfg(not(feature = "fake-probe"))]
-    drop(hub_device_id);
 
+    let (motor_dispatch_tx, motor_dispatch_rx) =
+        mpsc::sync_channel::<polling::MotorDispatchRequest>(MOTOR_DISPATCH_QUEUE_DEPTH);
     let (tx, rx) = mpsc::sync_channel::<SensorReading>(UPLINK_QUEUE_DEPTH);
-    spawn_uplink_worker(rx, jwt)?;
+    spawn_uplink_worker(rx, jwt.clone())?;
+    polling::spawn_command_polling_worker(hub_device_id.clone(), jwt, motor_dispatch_tx)?;
 
     info!("[BOOT] BLE device ready");
 
     loop {
+        drain_motor_dispatch_requests(ble_device, &motor_dispatch_rx);
+
         let candidates = match block_on(ble::scan_probe_candidates(ble_device)) {
             Ok(v) => v,
             Err(e) => {
                 error!("scan_probe_candidates failed: {e:#}");
-                thread::sleep(Duration::from_secs(SCAN_WAIT_SECONDS));
+                sleep_with_motor_dispatch(
+                    ble_device,
+                    &motor_dispatch_rx,
+                    Duration::from_secs(SCAN_WAIT_SECONDS),
+                );
                 continue;
             }
         };
@@ -137,11 +147,17 @@ fn main() -> Result<()> {
 
         if candidates.is_empty() {
             info!("No probe found this cycle, waiting {SCAN_WAIT_SECONDS}s...");
-            thread::sleep(Duration::from_secs(SCAN_WAIT_SECONDS));
+            sleep_with_motor_dispatch(
+                ble_device,
+                &motor_dispatch_rx,
+                Duration::from_secs(SCAN_WAIT_SECONDS),
+            );
             continue;
         }
 
         for candidate in &candidates {
+            drain_motor_dispatch_requests(ble_device, &motor_dispatch_rx);
+
             if matches!(candidate.meta.mode, ble::ProbeMode::Setup) {
                 match block_on(ble::acknowledge_setup_probe(ble_device, &candidate.device)) {
                     Ok(()) => info!(
@@ -157,7 +173,11 @@ fn main() -> Result<()> {
                         candidate.meta.name,
                     ),
                 }
-                thread::sleep(Duration::from_millis(500));
+                sleep_with_motor_dispatch(
+                    ble_device,
+                    &motor_dispatch_rx,
+                    Duration::from_millis(500),
+                );
                 continue;
             }
 
@@ -201,12 +221,35 @@ fn main() -> Result<()> {
                     candidate.meta.name,
                 ),
             }
-            thread::sleep(Duration::from_millis(500));
+            sleep_with_motor_dispatch(ble_device, &motor_dispatch_rx, Duration::from_millis(500));
         }
 
         info!("Polling cycle done. Waiting {SCAN_WAIT_SECONDS}s...");
-        thread::sleep(Duration::from_secs(SCAN_WAIT_SECONDS));
+        sleep_with_motor_dispatch(
+            ble_device,
+            &motor_dispatch_rx,
+            Duration::from_secs(SCAN_WAIT_SECONDS),
+        );
     }
+}
+
+fn sleep_with_motor_dispatch(
+    ble_device: &esp32_nimble::BLEDevice,
+    motor_dispatch_rx: &mpsc::Receiver<polling::MotorDispatchRequest>,
+    total_sleep: Duration,
+) {
+    let mut remaining = total_sleep;
+    let chunk = Duration::from_millis(MOTOR_DISPATCH_SLEEP_CHUNK_MS);
+
+    while remaining > Duration::ZERO {
+        drain_motor_dispatch_requests(ble_device, motor_dispatch_rx);
+
+        let current_sleep = remaining.min(chunk);
+        thread::sleep(current_sleep);
+        remaining = remaining.saturating_sub(current_sleep);
+    }
+
+    drain_motor_dispatch_requests(ble_device, motor_dispatch_rx);
 }
 
 fn log_setup_probes(probes: &[ble::SetupProbe]) {
@@ -223,6 +266,45 @@ fn log_setup_probes(probes: &[ble::SetupProbe]) {
     }
 }
 
+fn drain_motor_dispatch_requests(
+    ble_device: &esp32_nimble::BLEDevice,
+    motor_dispatch_rx: &mpsc::Receiver<polling::MotorDispatchRequest>,
+) {
+    loop {
+        match motor_dispatch_rx.try_recv() {
+            Ok(request) => {
+                let result = block_on(ble::dispatch_motor_command_to_probe(
+                    ble_device,
+                    &request.node_id,
+                    &request.command_id,
+                    request.action,
+                    request.duration_ms,
+                    request.expires_at_epoch_ms,
+                ));
+
+                if result.is_ok() {
+                    info!(
+                        "motor dispatch queue result: command_id={} node_id={} dispatch_status=delivered_to_ble reason_code=NONE",
+                        request.command_id,
+                        request.node_id
+                    );
+                } else {
+                    warn!(
+                        "motor dispatch queue result: command_id={} node_id={} dispatch_status=ble_failure reason_code=BLE_WRITE_FAILED err={:?}",
+                        request.command_id,
+                        request.node_id,
+                        result
+                    );
+                }
+
+                let _ = request.response_tx.send(result);
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
 fn provision_hub(nvs: EspDefaultNvsPartition) -> Result<(String, String)> {
     let (device_id, hub_secret) = persist::load_or_generate_creds(nvs.clone())?;
 
@@ -233,8 +315,9 @@ fn provision_hub(nvs: EspDefaultNvsPartition) -> Result<(String, String)> {
     }
 
     info!(
-        "\n=== HUB QR PAYLOAD ===\ndevice_id={device_id}\nhub_secret={hub_secret}\nuri={}\n======================\n",
-        setup_uri(&device_id, &hub_secret),
+        "hub setup credentials ready: device_id={} hub_name={} setup_uri=redacted local_dev_artifact=target/harvesthub-dev-identity.env",
+        device_id,
+        HUB_NAME,
     );
 
     if let Some(jwt) = persist::read_hub_jwt(nvs.clone())? {
@@ -255,27 +338,6 @@ fn provision_hub(nvs: EspDefaultNvsPartition) -> Result<(String, String)> {
     persist::write_hub_jwt(nvs, &jwt)?;
     info!("hub JWT obtained and persisted");
     Ok((device_id, jwt))
-}
-
-fn setup_uri(device_id: &str, hub_secret: &str) -> String {
-    format!(
-        "harvesthub://hub-setup?hub_uuid={device_id}&hub_secret={hub_secret}&hub_name={}",
-        encode_uri_component(HUB_NAME),
-    )
-}
-
-fn encode_uri_component(value: &str) -> String {
-    let mut encoded = String::new();
-
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-
-    encoded
 }
 
 fn claim_hub_after_time_sync(nvs: EspDefaultNvsPartition) -> Result<(String, String)> {

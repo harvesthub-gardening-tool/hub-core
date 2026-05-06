@@ -89,22 +89,15 @@ fn parse_identity_file(content: &str) -> Option<HubIdentity> {
 }
 
 fn print_setup_payload(identity: &HubIdentity, hub_name: &str) {
-    let setup_uri = format!(
-        "harvesthub://hub-setup?hub_uuid={}&hub_secret={}&hub_name={}",
-        identity.device_id,
-        identity.hub_secret,
-        encode_uri_component(hub_name),
-    );
-
     println!(
         "cargo:warning=HarvestHub setup hub_uuid={}",
         identity.device_id
     );
+    println!("cargo:warning=HarvestHub setup hub_name={}", hub_name);
     println!(
-        "cargo:warning=HarvestHub setup hub_secret={}",
-        identity.hub_secret
+        "cargo:warning=HarvestHub setup credentials stored securely in target/{} (uri redacted)",
+        IDENTITY_FILE_NAME
     );
-    println!("cargo:warning=HarvestHub setup uri={setup_uri}");
 }
 
 fn generate_uuid_v4() -> String {
@@ -139,19 +132,5 @@ fn hex_string(bytes: &[u8]) -> String {
     for byte in bytes {
         write!(&mut out, "{byte:02x}").expect("write hex");
     }
-    out
-}
-
-fn encode_uri_component(value: &str) -> String {
-    let mut out = String::new();
-
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(byte as char);
-        } else {
-            write!(&mut out, "%{byte:02X}").expect("write URI escape");
-        }
-    }
-
     out
 }

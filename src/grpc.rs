@@ -1,4 +1,8 @@
 use anyhow::Result;
+use protos_rust::control::v1::{
+    control_service_client::ControlServiceClient, AckMotorCommandEventRequest, MotorCommand,
+    MotorCommandReasonCode, MotorCommandStatus, PullPendingMotorCommandsRequest,
+};
 use protos_rust::garden::v2::{
     garden_service_client::GardenServiceClient, InsertSensorDataRequest,
 };
@@ -25,6 +29,7 @@ impl Interceptor for AuthInterceptor {
 
 pub struct HubClient {
     garden_client: GardenServiceClient<InterceptedService<Channel, AuthInterceptor>>,
+    control_client: ControlServiceClient<InterceptedService<Channel, AuthInterceptor>>,
 }
 
 pub struct SensorData<'a> {
@@ -48,9 +53,13 @@ impl HubClient {
         let metadata: MetadataValue<_> = format!("Bearer {}", token).parse()?;
         let interceptor = AuthInterceptor { token: metadata };
         let service = InterceptedService::new(channel, interceptor);
-        let garden_client = GardenServiceClient::new(service);
+        let garden_client = GardenServiceClient::new(service.clone());
+        let control_client = ControlServiceClient::new(service);
 
-        Ok(Self { garden_client })
+        Ok(Self {
+            garden_client,
+            control_client,
+        })
     }
 
     pub async fn send_data(&mut self, data: SensorData<'_>) -> Result<()> {
@@ -72,5 +81,49 @@ impl HubClient {
             anyhow::bail!("InsertSensorData rejected by server: {}", resp.message);
         }
         Ok(())
+    }
+
+    pub async fn pull_pending_motor_commands(
+        &mut self,
+        hub_id: &str,
+        max_commands: i32,
+        lease_duration_ms: i32,
+    ) -> Result<Vec<MotorCommand>> {
+        let resp = self
+            .control_client
+            .pull_pending_motor_commands(PullPendingMotorCommandsRequest {
+                hub_id: hub_id.to_string(),
+                max_commands,
+                lease_duration_ms,
+            })
+            .await?
+            .into_inner();
+
+        Ok(resp.commands)
+    }
+
+    pub async fn ack_motor_command_event(
+        &mut self,
+        command_id: &str,
+        hub_id: &str,
+        node_id: &str,
+        status: MotorCommandStatus,
+        reason_code: MotorCommandReasonCode,
+        reason_message: &str,
+    ) -> Result<Option<MotorCommand>> {
+        let resp = self
+            .control_client
+            .ack_motor_command_event(AckMotorCommandEventRequest {
+                command_id: command_id.to_string(),
+                hub_id: hub_id.to_string(),
+                node_id: node_id.to_string(),
+                status: status as i32,
+                reason_code: reason_code as i32,
+                reason_message: reason_message.to_string(),
+            })
+            .await?
+            .into_inner();
+
+        Ok(resp.command)
     }
 }

@@ -69,3 +69,29 @@ All values are read from the Environmental Sensing service
 | Probe UUID | `12340002-0000-1000-8000-00805f9b34fb` | 36-byte ASCII UUID | probe node id |
 | Soil temperature | `12340003-0000-1000-8000-00805f9b34fb` | `i16` big-endian centi-°C | °C |
 | Soil humidity | `12340004-0000-1000-8000-00805f9b34fb` | `u16` big-endian centi-% | % |
+
+### 3. Motor command reason-code map
+
+Use the same reason-code vocabulary across backend, hub, probe, and mobile surfaces.
+Logs should always include `command_id` and a `reason_code`, while user-facing mobile text
+should use the mapped French message rather than raw backend details.
+
+| Reason code | Backend / hub / probe meaning | Mobile user-facing message |
+| --- | --- | --- |
+| `NONE` | Normal in-flight or successful lifecycle step | No error shown |
+| `EXPIRED` | Command TTL elapsed before delivery or execution | `La commande a expiré avant de pouvoir être exécutée.` |
+| `PROBE_UNREACHABLE` | Hub could not find or reach the target probe over BLE | `La sonde est injoignable pour cette commande. Vérifiez sa connexion.` |
+| `BLE_WRITE_FAILED` | Hub failed while connecting/writing over BLE | `Le hub n'a pas pu transmettre la commande à la sonde.` |
+| `UART_TIMEOUT` | Probe motor UART write/flush/read/ack timed out or stalled | `La sonde a répondu trop tard au contrôleur moteur. Réessayez.` |
+| `UART_REJECTED` | Probe motor UART ack rejected or payload was invalid for motor adapter | `Le contrôleur moteur a rejeté la commande envoyée.` |
+| `DUPLICATE` | Duplicate command ID or active replay was rejected | `Cette commande moteur a déjà été prise en compte.` |
+| `SAFETY_LIMIT_EXCEEDED` | Requested action exceeded safety clamp/policy | `La commande dépasse la limite de sécurité autorisée.` |
+| `UNAUTHORIZED` | Auth or ownership rules rejected the command | `Vous n'êtes pas autorisé à piloter cette sonde.` |
+
+Operational notes:
+
+- Never log JWTs, hub secrets, passwords, or Bearer headers.
+- `reason_message` may contain implementation detail for operators, but mobile should display
+  the mapped reason-code message instead of raw backend strings.
+- Probe motor UART frames stay isolated by the `HHMC` marker/versioned binary envelope and do not
+  depend on suppressing existing debug UART logs.
