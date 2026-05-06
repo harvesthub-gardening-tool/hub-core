@@ -8,6 +8,7 @@ use protos_rust::control::v1::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,16 +24,30 @@ pub(crate) struct MotorDispatchRequest {
     pub(crate) response_tx: mpsc::Sender<Result<(), MotorDispatchFailure>>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct RadioMemoryGate {
+    mutex: Arc<Mutex<()>>,
+}
+
+impl RadioMemoryGate {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
+        self.mutex.lock().expect("radio/memory gate mutex poisoned")
+    }
+}
+
 pub fn spawn_command_polling_worker(
     hub_device_id: String,
     jwt: String,
     dispatch_tx: mpsc::SyncSender<MotorDispatchRequest>,
+    radio_memory_gate: RadioMemoryGate,
 ) -> Result<()> {
     thread::Builder::new()
         .name("cmd-poll".into())
         .stack_size(POLLING_THREAD_STACK)
         .spawn(move || {
-            if let Err(e) = run_command_polling_worker(hub_device_id, jwt, dispatch_tx) {
+            if let Err(e) =
+                run_command_polling_worker(hub_device_id, jwt, dispatch_tx, radio_memory_gate)
+            {
                 error!("command polling worker terminated: {e:#}");
             }
         })?;
@@ -44,10 +59,12 @@ fn run_command_polling_worker(
     hub_device_id: String,
     jwt: String,
     dispatch_tx: mpsc::SyncSender<MotorDispatchRequest>,
+    radio_memory_gate: RadioMemoryGate,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
+        .max_blocking_threads(1)
         .build()?;
 
     rt.block_on(async move {
@@ -57,7 +74,13 @@ fn run_command_polling_worker(
 
         loop {
             if client.is_none() {
-                match HubClient::connect_with_token(&jwt).await {
+                let connect_result = {
+                    let _radio_memory_guard = radio_memory_gate.lock();
+                    log_heap("before-command-poll-connect");
+                    HubClient::connect_with_token(&jwt).await
+                };
+
+                match connect_result {
                     Ok(c) => {
                         info!("command polling gRPC client connected");
                         client = Some(c);
@@ -73,16 +96,21 @@ fn run_command_polling_worker(
                 }
             }
 
-            let pulled = match client
-                .as_mut()
-                .expect("client exists")
-                .pull_pending_motor_commands(
-                    &hub_device_id,
-                    config::MOTOR_COMMAND_POLL_BATCH_SIZE,
-                    config::MOTOR_COMMAND_POLL_LEASE_DURATION_MS,
-                )
-                .await
-            {
+            let pulled_result = {
+                let _radio_memory_guard = radio_memory_gate.lock();
+                log_heap("before-command-poll-rpc");
+                client
+                    .as_mut()
+                    .expect("client exists")
+                    .pull_pending_motor_commands(
+                        &hub_device_id,
+                        config::MOTOR_COMMAND_POLL_BATCH_SIZE,
+                        config::MOTOR_COMMAND_POLL_LEASE_DURATION_MS,
+                    )
+                    .await
+            };
+
+            let pulled = match pulled_result {
                 Ok(commands) => {
                     backoff_ms = config::MOTOR_COMMAND_POLL_BACKOFF_INITIAL_MS;
                     commands
@@ -107,6 +135,7 @@ fn run_command_polling_worker(
                     client.as_mut().expect("client exists"),
                     &dispatch_tx,
                     &mut command_dedup,
+                    &radio_memory_gate,
                     command,
                 )
                 .await;
@@ -125,6 +154,7 @@ async fn handle_polled_command(
     client: &mut HubClient,
     dispatch_tx: &mpsc::SyncSender<MotorDispatchRequest>,
     command_dedup: &mut CommandDedupSet,
+    radio_memory_gate: &RadioMemoryGate,
     command: MotorCommand,
 ) {
     let command_id = command.command_id.clone();
@@ -159,6 +189,7 @@ async fn handle_polled_command(
         );
         ack_best_effort(
             client,
+            radio_memory_gate,
             &command_id,
             hub_device_id,
             &node_id,
@@ -184,6 +215,7 @@ async fn handle_polled_command(
                 );
                 ack_best_effort(
                     client,
+                    radio_memory_gate,
                     &command_id,
                     hub_device_id,
                     &node_id,
@@ -209,6 +241,7 @@ async fn handle_polled_command(
             );
             ack_best_effort(
                 client,
+                radio_memory_gate,
                 &command_id,
                 hub_device_id,
                 &node_id,
@@ -243,6 +276,7 @@ async fn handle_polled_command(
         );
         ack_best_effort(
             client,
+            radio_memory_gate,
             &command_id,
             hub_device_id,
             &node_id,
@@ -267,6 +301,7 @@ async fn handle_polled_command(
             );
             ack_best_effort(
                 client,
+                radio_memory_gate,
                 &command_id,
                 hub_device_id,
                 &node_id,
@@ -287,6 +322,7 @@ async fn handle_polled_command(
             );
             ack_best_effort(
                 client,
+                radio_memory_gate,
                 &command_id,
                 hub_device_id,
                 &node_id,
@@ -307,6 +343,7 @@ async fn handle_polled_command(
             );
             ack_best_effort(
                 client,
+                radio_memory_gate,
                 &command_id,
                 hub_device_id,
                 &node_id,
@@ -328,6 +365,7 @@ async fn handle_polled_command(
             );
             ack_best_effort(
                 client,
+                radio_memory_gate,
                 &command_id,
                 hub_device_id,
                 &node_id,
@@ -348,6 +386,7 @@ async fn handle_polled_command(
             );
             ack_best_effort(
                 client,
+                radio_memory_gate,
                 &command_id,
                 hub_device_id,
                 &node_id,
@@ -368,6 +407,7 @@ async fn handle_polled_command(
             );
             ack_best_effort(
                 client,
+                radio_memory_gate,
                 &command_id,
                 hub_device_id,
                 &node_id,
@@ -401,6 +441,7 @@ enum ParsedCommandAction {
 
 async fn ack_best_effort(
     client: &mut HubClient,
+    radio_memory_gate: &RadioMemoryGate,
     command_id: &str,
     hub_id: &str,
     node_id: &str,
@@ -408,17 +449,22 @@ async fn ack_best_effort(
     reason_code: MotorCommandReasonCode,
     reason_message: &str,
 ) {
-    if let Err(e) = client
-        .ack_motor_command_event(
-            command_id,
-            hub_id,
-            node_id,
-            status,
-            reason_code,
-            reason_message,
-        )
-        .await
-    {
+    let ack_result = {
+        let _radio_memory_guard = radio_memory_gate.lock();
+        log_heap("before-command-ack-rpc");
+        client
+            .ack_motor_command_event(
+                command_id,
+                hub_id,
+                node_id,
+                status,
+                reason_code,
+                reason_message,
+            )
+            .await
+    };
+
+    if let Err(e) = ack_result {
         error!(
             "command ack failed: command_id={} node_id={} status={} reason_code={} error={e:#}",
             command_id,
@@ -436,6 +482,12 @@ async fn ack_best_effort(
             reason_message,
         );
     }
+}
+
+fn log_heap(label: &str) {
+    let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let min_free_heap = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() };
+    info!("[HEAP] {label}: free={free_heap} min_free={min_free_heap}");
 }
 
 #[derive(Default)]

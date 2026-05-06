@@ -86,30 +86,43 @@ fn main() -> Result<()> {
     };
 
     info!("[BOOT] WiFi operational on ssid='{}'", wifi_creds.ssid);
+    log_heap("after-wifi");
 
     // Resolve hub identity + JWT. Order matters: `esp_fill_random` (used inside
     // `persist::load_or_generate_creds`) only emits CSPRNG-quality output once
     // Wi-Fi has been started, which is guaranteed by the calls above.
     let (hub_device_id, jwt) = claim_hub_after_time_sync(nvs_partition.clone())?;
+    log_heap("after-jwt");
 
     let (motor_dispatch_tx, motor_dispatch_rx) =
         mpsc::sync_channel::<polling::MotorDispatchRequest>(MOTOR_DISPATCH_QUEUE_DEPTH);
     let (tx, rx) = mpsc::sync_channel::<SensorReading>(UPLINK_QUEUE_DEPTH);
-    spawn_uplink_worker(rx, jwt.clone())?;
-    polling::spawn_command_polling_worker(hub_device_id.clone(), jwt, motor_dispatch_tx)?;
+    let radio_memory_gate = polling::RadioMemoryGate::default();
+    spawn_uplink_worker(rx, jwt.clone(), radio_memory_gate.clone())?;
+    polling::spawn_command_polling_worker(
+        hub_device_id.clone(),
+        jwt,
+        motor_dispatch_tx,
+        radio_memory_gate.clone(),
+    )?;
+    log_heap("after-workers-spawned");
 
     info!("[BOOT] BLE device ready");
 
     loop {
-        drain_motor_dispatch_requests(ble_device, &motor_dispatch_rx);
+        drain_motor_dispatch_requests(ble_device, &motor_dispatch_rx, &radio_memory_gate);
 
-        let candidates = match block_on(ble::scan_probe_candidates(ble_device)) {
+        let candidates = match run_with_radio_memory_gate(&radio_memory_gate, || {
+            log_heap("before-ble-scan");
+            block_on(ble::scan_probe_candidates(ble_device))
+        }) {
             Ok(v) => v,
             Err(e) => {
                 error!("scan_probe_candidates failed: {e:#}");
                 sleep_with_motor_dispatch(
                     ble_device,
                     &motor_dispatch_rx,
+                    &radio_memory_gate,
                     Duration::from_secs(SCAN_WAIT_SECONDS),
                 );
                 continue;
@@ -141,16 +154,19 @@ fn main() -> Result<()> {
             sleep_with_motor_dispatch(
                 ble_device,
                 &motor_dispatch_rx,
+                &radio_memory_gate,
                 Duration::from_secs(SCAN_WAIT_SECONDS),
             );
             continue;
         }
 
         for candidate in &candidates {
-            drain_motor_dispatch_requests(ble_device, &motor_dispatch_rx);
+            drain_motor_dispatch_requests(ble_device, &motor_dispatch_rx, &radio_memory_gate);
 
             if matches!(candidate.meta.mode, ble::ProbeMode::Setup) {
-                match block_on(ble::acknowledge_setup_probe(ble_device, &candidate.device)) {
+                match run_with_radio_memory_gate(&radio_memory_gate, || {
+                    block_on(ble::acknowledge_setup_probe(ble_device, &candidate.device))
+                }) {
                     Ok(()) => info!(
                         "setup probe acknowledged: addr={:?} name='{}' version={}.{}",
                         candidate.device.addr(),
@@ -167,12 +183,15 @@ fn main() -> Result<()> {
                 sleep_with_motor_dispatch(
                     ble_device,
                     &motor_dispatch_rx,
+                    &radio_memory_gate,
                     Duration::from_millis(500),
                 );
                 continue;
             }
 
-            match block_on(ble::read_probe_from_device(ble_device, &candidate.device)) {
+            match run_with_radio_memory_gate(&radio_memory_gate, || {
+                block_on(ble::read_probe_from_device(ble_device, &candidate.device))
+            }) {
                 Ok(Some(reading)) => {
                     info!(
                         "probe reading: addr={:?} probe_uuid={} name='{}' version={}.{} air_temp={:.2}°C air_pressure={:.0}Pa air_hum={:.2}% soil_temp={:.2}°C soil_hum={:.2}% ts={}",
@@ -212,13 +231,19 @@ fn main() -> Result<()> {
                     candidate.meta.name,
                 ),
             }
-            sleep_with_motor_dispatch(ble_device, &motor_dispatch_rx, Duration::from_millis(500));
+            sleep_with_motor_dispatch(
+                ble_device,
+                &motor_dispatch_rx,
+                &radio_memory_gate,
+                Duration::from_millis(500),
+            );
         }
 
         info!("Polling cycle done. Waiting {SCAN_WAIT_SECONDS}s...");
         sleep_with_motor_dispatch(
             ble_device,
             &motor_dispatch_rx,
+            &radio_memory_gate,
             Duration::from_secs(SCAN_WAIT_SECONDS),
         );
     }
@@ -227,20 +252,35 @@ fn main() -> Result<()> {
 fn sleep_with_motor_dispatch(
     ble_device: &esp32_nimble::BLEDevice,
     motor_dispatch_rx: &mpsc::Receiver<polling::MotorDispatchRequest>,
+    radio_memory_gate: &polling::RadioMemoryGate,
     total_sleep: Duration,
 ) {
     let mut remaining = total_sleep;
     let chunk = Duration::from_millis(MOTOR_DISPATCH_SLEEP_CHUNK_MS);
 
     while remaining > Duration::ZERO {
-        drain_motor_dispatch_requests(ble_device, motor_dispatch_rx);
+        drain_motor_dispatch_requests(ble_device, motor_dispatch_rx, radio_memory_gate);
 
         let current_sleep = remaining.min(chunk);
         thread::sleep(current_sleep);
         remaining = remaining.saturating_sub(current_sleep);
     }
 
-    drain_motor_dispatch_requests(ble_device, motor_dispatch_rx);
+    drain_motor_dispatch_requests(ble_device, motor_dispatch_rx, radio_memory_gate);
+}
+
+fn run_with_radio_memory_gate<T>(
+    radio_memory_gate: &polling::RadioMemoryGate,
+    f: impl FnOnce() -> T,
+) -> T {
+    let _guard = radio_memory_gate.lock();
+    f()
+}
+
+fn log_heap(label: &str) {
+    let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let min_free_heap = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() };
+    info!("[HEAP] {label}: free={free_heap} min_free={min_free_heap}");
 }
 
 fn restart_after_successful_provisioning(provisioned: wifi_prov::ProvisionedHub) -> ! {
@@ -278,18 +318,21 @@ fn log_setup_probes(probes: &[ble::SetupProbe]) {
 fn drain_motor_dispatch_requests(
     ble_device: &esp32_nimble::BLEDevice,
     motor_dispatch_rx: &mpsc::Receiver<polling::MotorDispatchRequest>,
+    radio_memory_gate: &polling::RadioMemoryGate,
 ) {
     loop {
         match motor_dispatch_rx.try_recv() {
             Ok(request) => {
-                let result = block_on(ble::dispatch_motor_command_to_probe(
-                    ble_device,
-                    &request.node_id,
-                    &request.command_id,
-                    request.action,
-                    request.duration_ms,
-                    request.expires_at_epoch_ms,
-                ));
+                let result = run_with_radio_memory_gate(radio_memory_gate, || {
+                    block_on(ble::dispatch_motor_command_to_probe(
+                        ble_device,
+                        &request.node_id,
+                        &request.command_id,
+                        request.action,
+                        request.duration_ms,
+                        request.expires_at_epoch_ms,
+                    ))
+                });
 
                 if result.is_ok() {
                     info!(
@@ -337,6 +380,7 @@ fn provision_hub(nvs: EspDefaultNvsPartition) -> Result<(String, String)> {
     info!("no JWT persisted; calling auth.v2.ClaimHubToken");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .max_blocking_threads(1)
         .build()
         .context("build tokio runtime for ClaimHubToken")?;
 
@@ -354,22 +398,31 @@ fn claim_hub_after_time_sync(nvs: EspDefaultNvsPartition) -> Result<(String, Str
     provision_hub(nvs)
 }
 
-fn spawn_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
+fn spawn_uplink_worker(
+    rx: Receiver<SensorReading>,
+    jwt: String,
+    radio_memory_gate: polling::RadioMemoryGate,
+) -> Result<()> {
     thread::Builder::new()
         .name("uplink".into())
         .stack_size(UPLINK_THREAD_STACK)
         .spawn(move || {
-            if let Err(e) = run_uplink_worker(rx, jwt) {
+            if let Err(e) = run_uplink_worker(rx, jwt, radio_memory_gate) {
                 error!("uplink worker terminated: {e:#}");
             }
         })?;
     Ok(())
 }
 
-fn run_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
+fn run_uplink_worker(
+    rx: Receiver<SensorReading>,
+    jwt: String,
+    radio_memory_gate: polling::RadioMemoryGate,
+) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
+        .max_blocking_threads(1)
         .build()?;
 
     rt.block_on(async move {
@@ -381,7 +434,13 @@ fn run_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
             for send_attempt in 1..=GRPC_SEND_MAX_ATTEMPTS {
                 if client.is_none() {
                     for connect_attempt in 1..=GRPC_CONNECT_MAX_ATTEMPTS {
-                        match grpc::HubClient::connect_with_token(&jwt).await {
+                        let connect_result = {
+                            let _guard = radio_memory_gate.lock();
+                            log_heap("before-uplink-connect");
+                            grpc::HubClient::connect_with_token(&jwt).await
+                        };
+
+                        match connect_result {
                             Ok(c) => {
                                 info!(
                                     "gRPC client connected (attempt {}/{})",
@@ -415,8 +474,10 @@ fn run_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
                 }
 
                 if let Some(c) = client.as_mut() {
-                    match c
-                        .send_data(grpc::SensorData {
+                    let send_result = {
+                        let _guard = radio_memory_gate.lock();
+                        log_heap("before-uplink-send");
+                        c.send_data(grpc::SensorData {
                             node_id: &reading.node_id,
                             air_temperature: reading.air_temperature_c,
                             air_pressure: reading.air_pressure_pa,
@@ -426,7 +487,9 @@ fn run_uplink_worker(rx: Receiver<SensorReading>, jwt: String) -> Result<()> {
                             timestamp: reading.timestamp_unix,
                         })
                         .await
-                    {
+                    };
+
+                    match send_result {
                         Ok(()) => {
                             info!(
                                 "uplink ok: node={} air_temp={:.2} air_pressure={:.0} air_hum={:.2} soil_temp={:.2} soil_hum={:.2} ts={}",

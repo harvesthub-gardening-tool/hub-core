@@ -293,6 +293,7 @@ fn acknowledge_setup_probes_in_database(jwt: &str, probes: &[ble::SetupProbe]) -
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
+        .max_blocking_threads(1)
         .build()
         .context("build tokio runtime for setup probe DB acknowledgement")?;
 

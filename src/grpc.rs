@@ -13,6 +13,10 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
 const API_URL: &str = env!("API_URL");
+const GRPC_CHANNEL_BUFFER_SIZE: usize = 8;
+const GRPC_CONCURRENCY_LIMIT: usize = 1;
+const GRPC_MAX_ENCODING_MESSAGE_SIZE: usize = 512;
+const GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 4096;
 
 #[derive(Clone)]
 struct AuthInterceptor {
@@ -47,14 +51,20 @@ impl HubClient {
         let channel = Endpoint::from_static(API_URL)
             .connect_timeout(std::time::Duration::from_secs(15))
             .timeout(std::time::Duration::from_secs(20))
+            .buffer_size(GRPC_CHANNEL_BUFFER_SIZE)
+            .concurrency_limit(GRPC_CONCURRENCY_LIMIT)
             .connect()
             .await?;
 
         let metadata: MetadataValue<_> = format!("Bearer {}", token).parse()?;
         let interceptor = AuthInterceptor { token: metadata };
         let service = InterceptedService::new(channel, interceptor);
-        let garden_client = GardenServiceClient::new(service.clone());
-        let control_client = ControlServiceClient::new(service);
+        let garden_client = GardenServiceClient::new(service.clone())
+            .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE)
+            .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE);
+        let control_client = ControlServiceClient::new(service)
+            .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE)
+            .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE);
 
         Ok(Self {
             garden_client,

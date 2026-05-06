@@ -12,6 +12,11 @@ use protos_rust::auth::v2::{auth_service_client::AuthServiceClient, ClaimHubToke
 use tonic::transport::Endpoint;
 use tonic::Code;
 
+const AUTH_CHANNEL_BUFFER_SIZE: usize = 4;
+const AUTH_CONCURRENCY_LIMIT: usize = 1;
+const AUTH_MAX_ENCODING_MESSAGE_SIZE: usize = 512;
+const AUTH_MAX_DECODING_MESSAGE_SIZE: usize = 4096;
+
 /// Distinct error: the device's claim slot is already consumed. Caller must
 /// instruct the user to revoke the hub from the mobile app before retrying.
 #[derive(Debug)]
@@ -38,11 +43,15 @@ pub async fn claim_hub_token(
     let channel = Endpoint::from_static(api_url)
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(20))
+        .buffer_size(AUTH_CHANNEL_BUFFER_SIZE)
+        .concurrency_limit(AUTH_CONCURRENCY_LIMIT)
         .connect()
         .await
         .context("connect to auth.v2.AuthService")?;
 
-    let mut client = AuthServiceClient::new(channel);
+    let mut client = AuthServiceClient::new(channel)
+        .max_encoding_message_size(AUTH_MAX_ENCODING_MESSAGE_SIZE)
+        .max_decoding_message_size(AUTH_MAX_DECODING_MESSAGE_SIZE);
 
     let resp = client
         .claim_hub_token(ClaimHubTokenRequest {
