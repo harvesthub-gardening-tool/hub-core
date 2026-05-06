@@ -93,7 +93,6 @@ fn main() -> Result<()> {
 
     log_heap("before-first-command-poll-window");
     poll_commands_in_quiet_window(
-        ble_device,
         &mut command_poller,
         &hub_device_id,
         &jwt,
@@ -113,7 +112,6 @@ fn main() -> Result<()> {
             Err(e) => {
                 error!("scan_probe_candidates failed: {e:#}");
                 poll_commands_in_quiet_window(
-                    ble_device,
                     &mut command_poller,
                     &hub_device_id,
                     &jwt,
@@ -145,7 +143,6 @@ fn main() -> Result<()> {
         if candidates.is_empty() {
             info!("No probe found this cycle, waiting {SCAN_WAIT_SECONDS}s...");
             poll_commands_in_quiet_window(
-                ble_device,
                 &mut command_poller,
                 &hub_device_id,
                 &jwt,
@@ -205,6 +202,15 @@ fn main() -> Result<()> {
                         timestamp_unix: reading.timestamp,
                     };
                     upload_reading(&jwt, &radio_memory_gate, &msg);
+                    dispatch_pending_commands_for_probe(
+                        ble_device,
+                        candidate,
+                        &mut command_poller,
+                        &hub_device_id,
+                        &jwt,
+                        &radio_memory_gate,
+                        reading.probe_uuid.as_str(),
+                    );
                 }
                 Ok(None) => info!(
                     "skip addr={:?} name='{}': probe service/chars not readable",
@@ -222,7 +228,6 @@ fn main() -> Result<()> {
 
         info!("Polling cycle done. Waiting {SCAN_WAIT_SECONDS}s...");
         poll_commands_in_quiet_window(
-            ble_device,
             &mut command_poller,
             &hub_device_id,
             &jwt,
@@ -233,26 +238,43 @@ fn main() -> Result<()> {
 }
 
 fn poll_commands_in_quiet_window(
-    ble_device: &esp32_nimble::BLEDevice,
     command_poller: &mut polling::CommandPoller,
     hub_device_id: &str,
     jwt: &str,
     radio_memory_gate: &polling::RadioMemoryGate,
 ) {
     info!("command poll quiet window starting");
-    command_poller.poll_once(hub_device_id, jwt, radio_memory_gate, |request| {
-        run_with_radio_memory_gate(radio_memory_gate, || {
-            block_on(ble::dispatch_motor_command_to_probe(
-                ble_device,
-                &request.node_id,
-                &request.command_id,
-                request.action,
-                request.duration_ms,
-                request.expires_at_epoch_ms,
-            ))
-        })
-    });
+    command_poller.poll_once(hub_device_id, jwt, radio_memory_gate);
     info!("command poll quiet window finished");
+}
+
+fn dispatch_pending_commands_for_probe(
+    ble_device: &esp32_nimble::BLEDevice,
+    candidate: &ble::ProbeCandidate,
+    command_poller: &mut polling::CommandPoller,
+    hub_device_id: &str,
+    jwt: &str,
+    radio_memory_gate: &polling::RadioMemoryGate,
+    probe_uuid: &str,
+) {
+    command_poller.dispatch_pending_for_probe(
+        hub_device_id,
+        jwt,
+        radio_memory_gate,
+        probe_uuid,
+        |request| {
+            run_with_radio_memory_gate(radio_memory_gate, || {
+                block_on(ble::dispatch_motor_command_to_candidate(
+                    ble_device,
+                    candidate,
+                    &request.command_id,
+                    request.action,
+                    request.duration_ms,
+                    request.expires_at_epoch_ms,
+                ))
+            })
+        },
+    );
 }
 
 fn upload_reading(

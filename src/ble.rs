@@ -61,7 +61,6 @@ pub(crate) struct SetupProbe {
 #[derive(Debug, Clone)]
 pub(crate) enum MotorDispatchFailure {
     Expired,
-    ProbeUnreachable,
     BleWriteFailed(String),
 }
 
@@ -267,51 +266,23 @@ pub(crate) fn build_motor_command_payload(
     Ok(payload)
 }
 
-pub(crate) async fn dispatch_motor_command_to_probe(
+pub(crate) async fn dispatch_motor_command_to_candidate(
     ble_device: &BLEDevice,
-    target_probe_uuid: &str,
+    candidate: &ProbeCandidate,
     command_id: &str,
     action: u8,
     duration_ms: i32,
     expires_at_ms: i64,
 ) -> Result<(), MotorDispatchFailure> {
-    let candidates = scan_probe_candidates(ble_device)
-        .await
-        .map_err(|e| MotorDispatchFailure::BleWriteFailed(format!("scan failed: {e:#}")))?;
-
-    for candidate in candidates
-        .iter()
-        .filter(|candidate| matches!(candidate.meta.mode, ProbeMode::Normal))
-    {
-        let probe_uuid = match read_probe_uuid_from_candidate(ble_device, candidate).await {
-            Ok(uuid) => uuid,
-            Err(e) => {
-                info!(
-                    "motor dispatch probe-id read failed: addr={:?} name='{}': {e:#}",
-                    candidate.device.addr(),
-                    candidate.meta.name,
-                );
-                continue;
-            }
-        };
-
-        if probe_uuid != target_probe_uuid {
-            continue;
-        }
-
-        write_motor_payload_to_candidate(
-            ble_device,
-            candidate,
-            command_id,
-            action,
-            duration_ms,
-            expires_at_ms,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    Err(MotorDispatchFailure::ProbeUnreachable)
+    write_motor_payload_to_candidate(
+        ble_device,
+        candidate,
+        command_id,
+        action,
+        duration_ms,
+        expires_at_ms,
+    )
+    .await
 }
 
 async fn read_setup_probe_identity(
@@ -377,43 +348,6 @@ async fn read_setup_probe_identity(
         version_major: candidate.meta.version_major,
         version_minor: candidate.meta.version_minor,
     })
-}
-
-async fn read_probe_uuid_from_candidate(
-    ble_device: &BLEDevice,
-    candidate: &ProbeCandidate,
-) -> anyhow::Result<String> {
-    let mut client = ble_device.new_client();
-
-    client.connect(&candidate.device.addr()).await?;
-
-    let service = match client
-        .get_service(uuid128!(ENVIRONMENTAL_SENSING_SERVICE_UUID))
-        .await
-    {
-        Ok(service) => service,
-        Err(e) => {
-            let _ = client.disconnect();
-            return Err(e).context("probe environmental service missing while resolving UUID");
-        }
-    };
-
-    let probe_uuid = match service
-        .get_characteristic(uuid128!(PROBE_UUID_CHAR_UUID))
-        .await
-    {
-        Ok(characteristic) => {
-            let raw = characteristic
-                .read_value()
-                .await
-                .context("probe uuid read failed while resolving target")?;
-            parse_probe_uuid_ascii(&raw).unwrap_or_else(|| candidate.device.addr().to_string())
-        }
-        Err(_) => candidate.device.addr().to_string(),
-    };
-
-    let _ = client.disconnect();
-    Ok(probe_uuid)
 }
 
 async fn write_motor_payload_to_candidate(

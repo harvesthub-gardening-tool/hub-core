@@ -12,10 +12,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) struct MotorDispatchRequest {
     pub(crate) command_id: String,
-    pub(crate) node_id: String,
     pub(crate) action: u8,
     pub(crate) duration_ms: i32,
     pub(crate) expires_at_epoch_ms: i64,
+}
+
+struct PendingMotorCommand {
+    command_id: String,
+    node_id: String,
+    action: u8,
+    duration_ms: i32,
+    expires_at_epoch_ms: i64,
 }
 
 #[derive(Clone, Default)]
@@ -32,6 +39,7 @@ impl RadioMemoryGate {
 #[derive(Default)]
 pub(crate) struct CommandPoller {
     command_dedup: CommandDedupSet,
+    pending: Vec<PendingMotorCommand>,
 }
 
 impl CommandPoller {
@@ -40,10 +48,9 @@ impl CommandPoller {
         hub_device_id: &str,
         jwt: &str,
         radio_memory_gate: &RadioMemoryGate,
-        mut dispatch_motor: impl FnMut(
-            MotorDispatchRequest,
-        ) -> std::result::Result<(), MotorDispatchFailure>,
     ) {
+        self.expire_pending_commands(hub_device_id, jwt, radio_memory_gate);
+
         let pulled = match pull_commands_once(jwt, hub_device_id, radio_memory_gate) {
             Ok(commands) => commands,
             Err(e) => {
@@ -57,14 +64,293 @@ impl CommandPoller {
         }
 
         for command in pulled {
-            handle_polled_command(
+            self.store_polled_command(hub_device_id, jwt, radio_memory_gate, command);
+        }
+    }
+
+    pub(crate) fn dispatch_pending_for_probe(
+        &mut self,
+        hub_device_id: &str,
+        jwt: &str,
+        radio_memory_gate: &RadioMemoryGate,
+        probe_uuid: &str,
+        mut dispatch_motor: impl FnMut(
+            MotorDispatchRequest,
+        ) -> std::result::Result<(), MotorDispatchFailure>,
+    ) {
+        let mut remaining = Vec::with_capacity(self.pending.len());
+        let pending = core::mem::take(&mut self.pending);
+
+        for command in pending {
+            if command.node_id != probe_uuid {
+                remaining.push(command);
+                continue;
+            }
+
+            if pending_command_is_expired(&command) {
+                warn!(
+                    "pending motor command expired before probe availability: command_id={} node_id={} status={} reason_code={} expires_at={}",
+                    command.command_id,
+                    command.node_id,
+                    MotorCommandStatus::Expired.as_str_name(),
+                    MotorCommandReasonCode::Expired.as_str_name(),
+                    command.expires_at_epoch_ms,
+                );
+                ack_best_effort(
+                    jwt,
+                    radio_memory_gate,
+                    &command.command_id,
+                    hub_device_id,
+                    &command.node_id,
+                    MotorCommandStatus::Expired,
+                    MotorCommandReasonCode::Expired,
+                    "command expired before probe became available",
+                );
+                self.command_dedup.finish_processed(&command.command_id);
+                continue;
+            }
+
+            self.dispatch_pending_command(
                 hub_device_id,
                 jwt,
-                &mut dispatch_motor,
-                &mut self.command_dedup,
                 radio_memory_gate,
                 command,
+                &mut dispatch_motor,
             );
+        }
+
+        self.pending = remaining;
+    }
+
+    fn store_polled_command(
+        &mut self,
+        hub_device_id: &str,
+        jwt: &str,
+        radio_memory_gate: &RadioMemoryGate,
+        command: MotorCommand,
+    ) {
+        let command_id = command.command_id.clone();
+        let node_id = command.node_id.clone();
+
+        match self.command_dedup.try_begin(&command_id) {
+            DedupBegin::AlreadyProcessed => {
+                info!(
+                    "skipping duplicate polled command already terminal in-memory: command_id={} node_id={}",
+                    command_id, node_id
+                );
+                return;
+            }
+            DedupBegin::AlreadyProcessing => {
+                info!(
+                    "skipping duplicate polled command already pending in-memory: command_id={} node_id={}",
+                    command_id, node_id
+                );
+                return;
+            }
+            DedupBegin::New => {}
+        };
+
+        if command_is_expired(&command) {
+            warn!(
+                "polled expired command ignored: command_id={} node_id={} status={} reason_code={} expires_at={}",
+                command_id,
+                node_id,
+                MotorCommandStatus::Expired.as_str_name(),
+                MotorCommandReasonCode::Expired.as_str_name(),
+                command.expires_at
+            );
+            ack_best_effort(
+                jwt,
+                radio_memory_gate,
+                &command_id,
+                hub_device_id,
+                &node_id,
+                MotorCommandStatus::Expired,
+                MotorCommandReasonCode::Expired,
+                "command expired before dispatch",
+            );
+            self.command_dedup.finish_processed(&command_id);
+            return;
+        }
+
+        let action = match parse_command_action(&command) {
+            ParsedCommandAction::RunForDuration { duration_ms } => {
+                if duration_ms < 0 {
+                    warn!(
+                        "polled command rejected before dispatch: command_id={} node_id={} status={} reason_code={} detail=invalid_negative_duration duration_ms={}",
+                        command_id,
+                        node_id,
+                        MotorCommandStatus::Failed.as_str_name(),
+                        MotorCommandReasonCode::BleWriteFailed.as_str_name(),
+                        duration_ms,
+                    );
+                    ack_best_effort(
+                        jwt,
+                        radio_memory_gate,
+                        &command_id,
+                        hub_device_id,
+                        &node_id,
+                        MotorCommandStatus::Failed,
+                        MotorCommandReasonCode::BleWriteFailed,
+                        "invalid negative motor duration",
+                    );
+                    self.command_dedup.finish_processed(&command_id);
+                    return;
+                }
+                config::MOTOR_COMMAND_ACTION_RUN_FOR_DURATION
+            }
+            ParsedCommandAction::Stop => config::MOTOR_COMMAND_ACTION_STOP,
+            ParsedCommandAction::Unknown { raw_action } => {
+                warn!(
+                    "polled command rejected before dispatch: command_id={} node_id={} status={} reason_code={} detail=unsupported_action raw_action={}",
+                    command_id,
+                    node_id,
+                    MotorCommandStatus::Failed.as_str_name(),
+                    MotorCommandReasonCode::BleWriteFailed.as_str_name(),
+                    raw_action,
+                );
+                ack_best_effort(
+                    jwt,
+                    radio_memory_gate,
+                    &command_id,
+                    hub_device_id,
+                    &node_id,
+                    MotorCommandStatus::Failed,
+                    MotorCommandReasonCode::BleWriteFailed,
+                    &format!("unsupported motor action value: {raw_action}"),
+                );
+                self.command_dedup.finish_processed(&command_id);
+                return;
+            }
+        };
+
+        info!(
+            "motor command pending until probe availability: command_id={} node_id={} expires_at={}",
+            command_id, node_id, command.expires_at
+        );
+        self.pending.push(PendingMotorCommand {
+            command_id,
+            node_id,
+            action,
+            duration_ms: command.duration_ms,
+            expires_at_epoch_ms: command.expires_at,
+        });
+    }
+
+    fn dispatch_pending_command(
+        &mut self,
+        hub_device_id: &str,
+        jwt: &str,
+        radio_memory_gate: &RadioMemoryGate,
+        command: PendingMotorCommand,
+        dispatch_motor: &mut impl FnMut(
+            MotorDispatchRequest,
+        ) -> std::result::Result<(), MotorDispatchFailure>,
+    ) {
+        let request = MotorDispatchRequest {
+            command_id: command.command_id.clone(),
+            action: command.action,
+            duration_ms: command.duration_ms,
+            expires_at_epoch_ms: command.expires_at_epoch_ms,
+        };
+
+        match dispatch_motor(request) {
+            Ok(()) => {
+                info!(
+                    "motor dispatch completed: command_id={} node_id={} dispatch_status={} ack_status={} reason_code={} ack_result=queued",
+                    command.command_id,
+                    command.node_id,
+                    "probe_write_acknowledged",
+                    MotorCommandStatus::SentToProbe.as_str_name(),
+                    MotorCommandReasonCode::None.as_str_name(),
+                );
+                ack_best_effort(
+                    jwt,
+                    radio_memory_gate,
+                    &command.command_id,
+                    hub_device_id,
+                    &command.node_id,
+                    MotorCommandStatus::SentToProbe,
+                    MotorCommandReasonCode::None,
+                    "motor command write acknowledged by probe",
+                );
+                self.command_dedup.finish_processed(&command.command_id);
+            }
+            Err(MotorDispatchFailure::Expired) => {
+                warn!(
+                    "motor dispatch expired before BLE write: command_id={} node_id={} dispatch_status=expired ack_status={} reason_code={} ack_result=queued",
+                    command.command_id,
+                    command.node_id,
+                    MotorCommandStatus::Expired.as_str_name(),
+                    MotorCommandReasonCode::Expired.as_str_name(),
+                );
+                ack_best_effort(
+                    jwt,
+                    radio_memory_gate,
+                    &command.command_id,
+                    hub_device_id,
+                    &command.node_id,
+                    MotorCommandStatus::Expired,
+                    MotorCommandReasonCode::Expired,
+                    "command expired before BLE write",
+                );
+                self.command_dedup.finish_processed(&command.command_id);
+            }
+            Err(MotorDispatchFailure::BleWriteFailed(message)) => {
+                warn!(
+                    "motor dispatch BLE failure: command_id={} node_id={} dispatch_status=ble_write_failed ack_status={} reason_code={} detail={}",
+                    command.command_id,
+                    command.node_id,
+                    MotorCommandStatus::Failed.as_str_name(),
+                    MotorCommandReasonCode::BleWriteFailed.as_str_name(),
+                    message,
+                );
+                ack_best_effort(
+                    jwt,
+                    radio_memory_gate,
+                    &command.command_id,
+                    hub_device_id,
+                    &command.node_id,
+                    MotorCommandStatus::Failed,
+                    MotorCommandReasonCode::BleWriteFailed,
+                    &message,
+                );
+                self.command_dedup.finish_processed(&command.command_id);
+            }
+        }
+    }
+
+    fn expire_pending_commands(
+        &mut self,
+        hub_device_id: &str,
+        jwt: &str,
+        radio_memory_gate: &RadioMemoryGate,
+    ) {
+        let pending = core::mem::take(&mut self.pending);
+        for command in pending {
+            if pending_command_is_expired(&command) {
+                warn!(
+                    "pending motor command expired: command_id={} node_id={} status={} reason_code={} expires_at={}",
+                    command.command_id,
+                    command.node_id,
+                    MotorCommandStatus::Expired.as_str_name(),
+                    MotorCommandReasonCode::Expired.as_str_name(),
+                    command.expires_at_epoch_ms,
+                );
+                ack_best_effort(
+                    jwt,
+                    radio_memory_gate,
+                    &command.command_id,
+                    hub_device_id,
+                    &command.node_id,
+                    MotorCommandStatus::Expired,
+                    MotorCommandReasonCode::Expired,
+                    "command expired before probe became available",
+                );
+                self.command_dedup.finish_processed(&command.command_id);
+            } else {
+                self.pending.push(command);
+            }
         }
     }
 }
@@ -95,205 +381,6 @@ fn pull_commands_once(
             )
             .await
     })
-}
-
-fn handle_polled_command(
-    hub_device_id: &str,
-    jwt: &str,
-    dispatch_motor: &mut impl FnMut(
-        MotorDispatchRequest,
-    ) -> std::result::Result<(), MotorDispatchFailure>,
-    command_dedup: &mut CommandDedupSet,
-    radio_memory_gate: &RadioMemoryGate,
-    command: MotorCommand,
-) {
-    let command_id = command.command_id.clone();
-    let node_id = command.node_id.clone();
-
-    match command_dedup.try_begin(&command_id) {
-        DedupBegin::AlreadyProcessed => {
-            info!(
-                "skipping duplicate polled command already terminal in-memory: command_id={} node_id={}",
-                command_id, node_id
-            );
-            return;
-        }
-        DedupBegin::AlreadyProcessing => {
-            info!(
-                "skipping duplicate polled command already in-flight in-memory: command_id={} node_id={}",
-                command_id, node_id
-            );
-            return;
-        }
-        DedupBegin::New => {}
-    };
-
-    if command_is_expired(&command) {
-        warn!(
-            "polled expired command ignored: command_id={} node_id={} status={} reason_code={} expires_at={}",
-            command_id,
-            node_id,
-            MotorCommandStatus::Expired.as_str_name(),
-            MotorCommandReasonCode::Expired.as_str_name(),
-            command.expires_at
-        );
-        ack_best_effort(
-            jwt,
-            radio_memory_gate,
-            &command_id,
-            hub_device_id,
-            &node_id,
-            MotorCommandStatus::Expired,
-            MotorCommandReasonCode::Expired,
-            "command expired before dispatch",
-        );
-        command_dedup.finish_processed(&command_id);
-        return;
-    }
-
-    let action = match parse_command_action(&command) {
-        ParsedCommandAction::RunForDuration { duration_ms } => {
-            if duration_ms < 0 {
-                warn!(
-                    "polled command rejected before dispatch: command_id={} node_id={} status={} reason_code={} detail=invalid_negative_duration duration_ms={}",
-                    command_id,
-                    node_id,
-                    MotorCommandStatus::Failed.as_str_name(),
-                    MotorCommandReasonCode::BleWriteFailed.as_str_name(),
-                    duration_ms,
-                );
-                ack_best_effort(
-                    jwt,
-                    radio_memory_gate,
-                    &command_id,
-                    hub_device_id,
-                    &node_id,
-                    MotorCommandStatus::Failed,
-                    MotorCommandReasonCode::BleWriteFailed,
-                    "invalid negative motor duration",
-                );
-                command_dedup.finish_processed(&command_id);
-                return;
-            }
-            config::MOTOR_COMMAND_ACTION_RUN_FOR_DURATION
-        }
-        ParsedCommandAction::Stop => config::MOTOR_COMMAND_ACTION_STOP,
-        ParsedCommandAction::Unknown { raw_action } => {
-            warn!(
-                "polled command rejected before dispatch: command_id={} node_id={} status={} reason_code={} detail=unsupported_action raw_action={}",
-                command_id,
-                node_id,
-                MotorCommandStatus::Failed.as_str_name(),
-                MotorCommandReasonCode::BleWriteFailed.as_str_name(),
-                raw_action,
-            );
-            ack_best_effort(
-                jwt,
-                radio_memory_gate,
-                &command_id,
-                hub_device_id,
-                &node_id,
-                MotorCommandStatus::Failed,
-                MotorCommandReasonCode::BleWriteFailed,
-                &format!("unsupported motor action value: {raw_action}"),
-            );
-            command_dedup.finish_processed(&command_id);
-            return;
-        }
-    };
-
-    let request = MotorDispatchRequest {
-        command_id: command_id.clone(),
-        node_id: node_id.clone(),
-        action,
-        duration_ms: command.duration_ms,
-        expires_at_epoch_ms: command.expires_at,
-    };
-
-    match dispatch_motor(request) {
-        Ok(()) => {
-            info!(
-                "motor dispatch completed: command_id={} node_id={} dispatch_status={} ack_status={} reason_code={} ack_result=queued",
-                command_id,
-                node_id,
-                "probe_write_acknowledged",
-                MotorCommandStatus::SentToProbe.as_str_name(),
-                MotorCommandReasonCode::None.as_str_name(),
-            );
-            ack_best_effort(
-                jwt,
-                radio_memory_gate,
-                &command_id,
-                hub_device_id,
-                &node_id,
-                MotorCommandStatus::SentToProbe,
-                MotorCommandReasonCode::None,
-                "motor command write acknowledged by probe",
-            );
-            command_dedup.finish_processed(&command_id);
-        }
-        Err(MotorDispatchFailure::ProbeUnreachable) => {
-            warn!(
-                "motor dispatch failed: command_id={} node_id={} dispatch_status=probe_unreachable ack_status={} reason_code={} ack_result=queued",
-                command_id,
-                node_id,
-                MotorCommandStatus::Failed.as_str_name(),
-                MotorCommandReasonCode::ProbeUnreachable.as_str_name(),
-            );
-            ack_best_effort(
-                jwt,
-                radio_memory_gate,
-                &command_id,
-                hub_device_id,
-                &node_id,
-                MotorCommandStatus::Failed,
-                MotorCommandReasonCode::ProbeUnreachable,
-                "target probe not found over BLE",
-            );
-            command_dedup.finish_processed(&command_id);
-        }
-        Err(MotorDispatchFailure::Expired) => {
-            warn!(
-                "motor dispatch expired before BLE write: command_id={} node_id={} dispatch_status=expired ack_status={} reason_code={} ack_result=queued",
-                command_id,
-                node_id,
-                MotorCommandStatus::Expired.as_str_name(),
-                MotorCommandReasonCode::Expired.as_str_name(),
-            );
-            ack_best_effort(
-                jwt,
-                radio_memory_gate,
-                &command_id,
-                hub_device_id,
-                &node_id,
-                MotorCommandStatus::Expired,
-                MotorCommandReasonCode::Expired,
-                "command expired before BLE write",
-            );
-            command_dedup.finish_processed(&command_id);
-        }
-        Err(MotorDispatchFailure::BleWriteFailed(message)) => {
-            warn!(
-                "motor dispatch BLE failure: command_id={} node_id={} dispatch_status=ble_write_failed ack_status={} reason_code={} detail={}",
-                command_id,
-                node_id,
-                MotorCommandStatus::Failed.as_str_name(),
-                MotorCommandReasonCode::BleWriteFailed.as_str_name(),
-                message,
-            );
-            ack_best_effort(
-                jwt,
-                radio_memory_gate,
-                &command_id,
-                hub_device_id,
-                &node_id,
-                MotorCommandStatus::Failed,
-                MotorCommandReasonCode::BleWriteFailed,
-                &message,
-            );
-            command_dedup.finish_processed(&command_id);
-        }
-    }
 }
 
 fn parse_command_action(command: &MotorCommand) -> ParsedCommandAction {
@@ -454,6 +541,12 @@ fn command_is_expired(command: &MotorCommand) -> bool {
     let now_ms = unix_now_ms();
 
     command.expires_at > 0 && command.expires_at <= now_ms
+}
+
+fn pending_command_is_expired(command: &PendingMotorCommand) -> bool {
+    let now_ms = unix_now_ms();
+
+    command.expires_at_epoch_ms > 0 && command.expires_at_epoch_ms <= now_ms
 }
 
 fn unix_now_ms() -> i64 {
