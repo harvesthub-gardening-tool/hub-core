@@ -1,8 +1,8 @@
 // src/nvs_store.rs
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
-use log::info;
+use log::{info, warn};
 
 const NVS_NAMESPACE: &str = "harvesthub";
 const KEY_SSID: &str = "wifi_ssid";
@@ -19,18 +19,30 @@ fn open_nvs(nvs_partition: EspDefaultNvsPartition) -> Result<EspNvs<NvsDefault>>
 }
 
 pub fn load(nvs_partition: EspDefaultNvsPartition) -> Option<WifiCredentials> {
-    let nvs = open_nvs(nvs_partition).ok()?;
+    let nvs = match open_nvs(nvs_partition) {
+        Ok(handle) => handle,
+        Err(e) => {
+            warn!("[NVS] Impossible d'ouvrir les credentials Wi-Fi : {e:#}");
+            return None;
+        }
+    };
 
-    // get_str retourne Option<&str> dans le buffer fourni
-    let mut ssid_buf = [0u8; 33];
-    let mut pass_buf = [0u8; 65];
-
-    // get_str remplit le buffer et retourne Some(longueur) ou None
-    let ssid = nvs.get_str(KEY_SSID, &mut ssid_buf).ok()??;
-    let pass = nvs.get_str(KEY_PASS, &mut pass_buf).ok()??;
-
-    let ssid = ssid.trim_end_matches('\0').to_string();
-    let pass = pass.trim_end_matches('\0').to_string();
+    let ssid = match read_str(&nvs, KEY_SSID) {
+        Ok(Some(value)) => value,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!("[NVS] Lecture SSID Wi-Fi impossible : {e:#}");
+            return None;
+        }
+    };
+    let pass = match read_str(&nvs, KEY_PASS) {
+        Ok(Some(value)) => value,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!("[NVS] Lecture password Wi-Fi impossible : {e:#}");
+            return None;
+        }
+    };
 
     if ssid.is_empty() {
         return None;
@@ -41,6 +53,22 @@ pub fn load(nvs_partition: EspDefaultNvsPartition) -> Option<WifiCredentials> {
         ssid,
         password: pass,
     })
+}
+
+fn read_str(handle: &EspNvs<NvsDefault>, key: &str) -> Result<Option<String>> {
+    let Some(len) = handle
+        .str_len(key)
+        .with_context(|| format!("nvs str_len('{key}')"))?
+    else {
+        return Ok(None);
+    };
+
+    let mut buf = vec![0u8; len];
+    let value = handle
+        .get_str(key, &mut buf)
+        .with_context(|| format!("nvs get_str('{key}')"))?
+        .map(ToOwned::to_owned);
+    Ok(value)
 }
 
 pub fn save(nvs_partition: EspDefaultNvsPartition, creds: &WifiCredentials) -> Result<()> {

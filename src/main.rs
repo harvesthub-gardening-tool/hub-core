@@ -55,8 +55,6 @@ fn main() -> Result<()> {
     // for both BLE provisioning (if triggered) and the probe scan loop.
     let ble_device = ble::init_device();
 
-    let mut claimed_hub_identity: Option<(String, String)> = None;
-
     let wifi_creds = match nvs_store::load(nvs_partition.clone()) {
         Some(creds) => {
             info!(
@@ -74,9 +72,7 @@ fn main() -> Result<()> {
                         wifi_prov::run(ble_device, nvs_partition.clone(), &mut wifi, || {
                             claim_hub_after_time_sync(nvs_partition.clone())
                         })?;
-                    log_setup_probes(&provisioned.setup_probes);
-                    claimed_hub_identity = Some((provisioned.hub_device_id, provisioned.jwt));
-                    provisioned.credentials
+                    restart_after_successful_provisioning(provisioned);
                 }
             }
         }
@@ -85,9 +81,7 @@ fn main() -> Result<()> {
             let provisioned = wifi_prov::run(ble_device, nvs_partition.clone(), &mut wifi, || {
                 claim_hub_after_time_sync(nvs_partition.clone())
             })?;
-            log_setup_probes(&provisioned.setup_probes);
-            claimed_hub_identity = Some((provisioned.hub_device_id, provisioned.jwt));
-            provisioned.credentials
+            restart_after_successful_provisioning(provisioned);
         }
     };
 
@@ -96,10 +90,7 @@ fn main() -> Result<()> {
     // Resolve hub identity + JWT. Order matters: `esp_fill_random` (used inside
     // `persist::load_or_generate_creds`) only emits CSPRNG-quality output once
     // Wi-Fi has been started, which is guaranteed by the calls above.
-    let (hub_device_id, jwt) = match claimed_hub_identity {
-        Some(identity) => identity,
-        None => claim_hub_after_time_sync(nvs_partition.clone())?,
-    };
+    let (hub_device_id, jwt) = claim_hub_after_time_sync(nvs_partition.clone())?;
 
     let (motor_dispatch_tx, motor_dispatch_rx) =
         mpsc::sync_channel::<polling::MotorDispatchRequest>(MOTOR_DISPATCH_QUEUE_DEPTH);
@@ -250,6 +241,24 @@ fn sleep_with_motor_dispatch(
     }
 
     drain_motor_dispatch_requests(ble_device, motor_dispatch_rx);
+}
+
+fn restart_after_successful_provisioning(provisioned: wifi_prov::ProvisionedHub) -> ! {
+    log_setup_probes(&provisioned.setup_probes);
+    let hub_device_id = provisioned.hub_device_id;
+    let jwt_len = provisioned.jwt.len();
+    info!(
+        "[BOOT] Provisioning complete for ssid='{}' hub_device_id={} jwt_bytes={}; restarting to boot from saved credentials",
+        provisioned.credentials.ssid,
+        hub_device_id,
+        jwt_len
+    );
+    thread::sleep(Duration::from_millis(500));
+
+    // A provisioning session leaves BLE/Wi-Fi/gRPC setup state resident. Restarting
+    // after credentials and the hub JWT are persisted gives the normal boot path a
+    // clean heap before it spawns the long-lived uplink and command-polling workers.
+    unsafe { esp_idf_svc::sys::esp_restart() }
 }
 
 fn log_setup_probes(probes: &[ble::SetupProbe]) {
