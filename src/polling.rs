@@ -15,7 +15,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const POLLING_THREAD_STACK: usize = 32 * 1024;
 const MOTOR_DISPATCH_RESPONSE_TIMEOUT_MS: u64 = 20_000;
 const FIRST_POLL_WAIT_TIMEOUT_MS: u64 = 10_000;
-const POLL_WAKE_CHECK_MS: u64 = 100;
 
 pub(crate) struct MotorDispatchRequest {
     pub(crate) command_id: String,
@@ -115,37 +114,19 @@ fn run_command_polling_worker(
         .build()?;
 
     rt.block_on(async move {
-        let mut backoff_ms: u64 = config::MOTOR_COMMAND_POLL_BACKOFF_INITIAL_MS;
         let mut command_dedup = CommandDedupSet::default();
         let mut first_poll_marked = false;
 
         loop {
-            let pulled_result = {
-                let _radio_memory_guard = radio_memory_gate.lock();
-                log_heap("before-command-poll-connect");
-                match HubClient::connect_with_token(&jwt).await {
-                    Ok(client) => {
-                        info!("command polling gRPC client connected");
-                        let mut client = client;
-                        log_heap("before-command-poll-rpc");
-                        client
-                            .pull_pending_motor_commands(
-                                &hub_device_id,
-                                config::MOTOR_COMMAND_POLL_BATCH_SIZE,
-                                config::MOTOR_COMMAND_POLL_LEASE_DURATION_MS,
-                            )
-                            .await
-                    }
-                    Err(e) => {
-                        error!("command polling gRPC connect failed: {e:#}");
-                        Err(e)
-                    }
-                }
-            };
+            if first_poll_marked && !wait_for_next_poll_window(&poll_wake_rx) {
+                warn!("command poll wake channel disconnected; stopping polling worker");
+                break;
+            }
+
+            let pulled_result = pull_commands_once(&jwt, &hub_device_id, &radio_memory_gate).await;
 
             let pulled = match pulled_result {
                 Ok(commands) => {
-                    backoff_ms = config::MOTOR_COMMAND_POLL_BACKOFF_INITIAL_MS;
                     if !first_poll_marked {
                         poll_readiness.mark_first_poll_finished();
                         first_poll_marked = true;
@@ -158,9 +139,6 @@ fn run_command_polling_worker(
                         poll_readiness.mark_first_poll_finished();
                         first_poll_marked = true;
                     }
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms.saturating_mul(2))
-                        .min(config::MOTOR_COMMAND_POLL_BACKOFF_MAX_MS);
                     continue;
                 }
             };
@@ -180,13 +158,30 @@ fn run_command_polling_worker(
                 )
                 .await;
             }
-
-            let interval_ms = poll_interval_with_jitter_ms();
-            wait_for_next_poll_window(&poll_wake_rx, interval_ms).await;
         }
     });
 
     Ok(())
+}
+
+async fn pull_commands_once(
+    jwt: &str,
+    hub_device_id: &str,
+    radio_memory_gate: &RadioMemoryGate,
+) -> Result<Vec<MotorCommand>> {
+    let _radio_memory_guard = radio_memory_gate.lock();
+    log_heap("before-command-poll-connect");
+    let mut client = HubClient::connect_with_token(jwt).await?;
+
+    info!("command polling gRPC client connected");
+    log_heap("before-command-poll-rpc");
+    client
+        .pull_pending_motor_commands(
+            hub_device_id,
+            config::MOTOR_COMMAND_POLL_BATCH_SIZE,
+            config::MOTOR_COMMAND_POLL_LEASE_DURATION_MS,
+        )
+        .await
 }
 
 async fn handle_polled_command(
@@ -612,36 +607,9 @@ fn unix_now_ms() -> i64 {
     }
 }
 
-fn poll_interval_with_jitter_ms() -> u64 {
-    let base = config::MOTOR_COMMAND_POLL_INTERVAL_MS;
-    let jitter = config::MOTOR_COMMAND_POLL_JITTER_MS;
-
-    if jitter == 0 {
-        return base;
-    }
-
-    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(ts) => ts.subsec_nanos() as u64,
-        Err(_) => 0,
-    };
-
-    let span = jitter.saturating_mul(2).saturating_add(1);
-    let offset = (now % span) as i64 - jitter as i64;
-    base.saturating_add_signed(offset)
-}
-
-async fn wait_for_next_poll_window(poll_wake_rx: &mpsc::Receiver<()>, interval_ms: u64) {
-    let mut waited_ms = 0;
-
-    while waited_ms < interval_ms {
-        match poll_wake_rx.try_recv() {
-            Ok(()) => return,
-            Err(mpsc::TryRecvError::Disconnected) => return,
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-
-        let sleep_ms = POLL_WAKE_CHECK_MS.min(interval_ms.saturating_sub(waited_ms));
-        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-        waited_ms = waited_ms.saturating_add(sleep_ms);
+fn wait_for_next_poll_window(poll_wake_rx: &mpsc::Receiver<()>) -> bool {
+    match poll_wake_rx.recv() {
+        Ok(()) => true,
+        Err(_) => false,
     }
 }
