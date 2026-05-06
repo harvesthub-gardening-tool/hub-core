@@ -8,12 +8,14 @@ use protos_rust::control::v1::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const POLLING_THREAD_STACK: usize = 32 * 1024;
 const MOTOR_DISPATCH_RESPONSE_TIMEOUT_MS: u64 = 20_000;
+const FIRST_POLL_WAIT_TIMEOUT_MS: u64 = 10_000;
+const POLL_WAKE_CHECK_MS: u64 = 100;
 
 pub(crate) struct MotorDispatchRequest {
     pub(crate) command_id: String,
@@ -29,9 +31,45 @@ pub(crate) struct RadioMemoryGate {
     mutex: Arc<Mutex<()>>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct PollReadiness {
+    state: Arc<(Mutex<PollReadinessState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct PollReadinessState {
+    first_poll_finished: bool,
+}
+
 impl RadioMemoryGate {
     pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
         self.mutex.lock().expect("radio/memory gate mutex poisoned")
+    }
+}
+
+impl PollReadiness {
+    pub(crate) fn wait_for_first_poll(&self) -> bool {
+        let (lock, cvar) = &*self.state;
+        let state = lock.lock().expect("poll readiness mutex poisoned");
+
+        let (state, _) = cvar
+            .wait_timeout_while(
+                state,
+                Duration::from_millis(FIRST_POLL_WAIT_TIMEOUT_MS),
+                |state| !state.first_poll_finished,
+            )
+            .expect("poll readiness mutex poisoned");
+
+        state.first_poll_finished
+    }
+
+    fn mark_first_poll_finished(&self) {
+        let (lock, cvar) = &*self.state;
+        let mut state = lock.lock().expect("poll readiness mutex poisoned");
+        if !state.first_poll_finished {
+            state.first_poll_finished = true;
+            cvar.notify_all();
+        }
     }
 }
 
@@ -40,14 +78,21 @@ pub fn spawn_command_polling_worker(
     jwt: String,
     dispatch_tx: mpsc::SyncSender<MotorDispatchRequest>,
     radio_memory_gate: RadioMemoryGate,
+    poll_readiness: PollReadiness,
+    poll_wake_rx: mpsc::Receiver<()>,
 ) -> Result<()> {
     thread::Builder::new()
         .name("cmd-poll".into())
         .stack_size(POLLING_THREAD_STACK)
         .spawn(move || {
-            if let Err(e) =
-                run_command_polling_worker(hub_device_id, jwt, dispatch_tx, radio_memory_gate)
-            {
+            if let Err(e) = run_command_polling_worker(
+                hub_device_id,
+                jwt,
+                dispatch_tx,
+                radio_memory_gate,
+                poll_readiness,
+                poll_wake_rx,
+            ) {
                 error!("command polling worker terminated: {e:#}");
             }
         })?;
@@ -60,6 +105,8 @@ fn run_command_polling_worker(
     jwt: String,
     dispatch_tx: mpsc::SyncSender<MotorDispatchRequest>,
     radio_memory_gate: RadioMemoryGate,
+    poll_readiness: PollReadiness,
+    poll_wake_rx: mpsc::Receiver<()>,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -68,56 +115,49 @@ fn run_command_polling_worker(
         .build()?;
 
     rt.block_on(async move {
-        let mut client: Option<HubClient> = None;
         let mut backoff_ms: u64 = config::MOTOR_COMMAND_POLL_BACKOFF_INITIAL_MS;
         let mut command_dedup = CommandDedupSet::default();
+        let mut first_poll_marked = false;
 
         loop {
-            if client.is_none() {
-                let connect_result = {
-                    let _radio_memory_guard = radio_memory_gate.lock();
-                    log_heap("before-command-poll-connect");
-                    HubClient::connect_with_token(&jwt).await
-                };
-
-                match connect_result {
-                    Ok(c) => {
+            let pulled_result = {
+                let _radio_memory_guard = radio_memory_gate.lock();
+                log_heap("before-command-poll-connect");
+                match HubClient::connect_with_token(&jwt).await {
+                    Ok(client) => {
                         info!("command polling gRPC client connected");
-                        client = Some(c);
-                        backoff_ms = config::MOTOR_COMMAND_POLL_BACKOFF_INITIAL_MS;
+                        let mut client = client;
+                        log_heap("before-command-poll-rpc");
+                        client
+                            .pull_pending_motor_commands(
+                                &hub_device_id,
+                                config::MOTOR_COMMAND_POLL_BATCH_SIZE,
+                                config::MOTOR_COMMAND_POLL_LEASE_DURATION_MS,
+                            )
+                            .await
                     }
                     Err(e) => {
                         error!("command polling gRPC connect failed: {e:#}");
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = (backoff_ms.saturating_mul(2))
-                            .min(config::MOTOR_COMMAND_POLL_BACKOFF_MAX_MS);
-                        continue;
+                        Err(e)
                     }
                 }
-            }
-
-            let pulled_result = {
-                let _radio_memory_guard = radio_memory_gate.lock();
-                log_heap("before-command-poll-rpc");
-                client
-                    .as_mut()
-                    .expect("client exists")
-                    .pull_pending_motor_commands(
-                        &hub_device_id,
-                        config::MOTOR_COMMAND_POLL_BATCH_SIZE,
-                        config::MOTOR_COMMAND_POLL_LEASE_DURATION_MS,
-                    )
-                    .await
             };
 
             let pulled = match pulled_result {
                 Ok(commands) => {
                     backoff_ms = config::MOTOR_COMMAND_POLL_BACKOFF_INITIAL_MS;
+                    if !first_poll_marked {
+                        poll_readiness.mark_first_poll_finished();
+                        first_poll_marked = true;
+                    }
                     commands
                 }
                 Err(e) => {
-                    error!("command polling RPC failed: {e:#}");
-                    client = None;
+                    error!("command polling connect/RPC failed: {e:#}");
+                    if !first_poll_marked {
+                        poll_readiness.mark_first_poll_finished();
+                        first_poll_marked = true;
+                    }
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms.saturating_mul(2))
                         .min(config::MOTOR_COMMAND_POLL_BACKOFF_MAX_MS);
@@ -132,7 +172,7 @@ fn run_command_polling_worker(
             for command in pulled {
                 handle_polled_command(
                     &hub_device_id,
-                    client.as_mut().expect("client exists"),
+                    &jwt,
                     &dispatch_tx,
                     &mut command_dedup,
                     &radio_memory_gate,
@@ -142,7 +182,7 @@ fn run_command_polling_worker(
             }
 
             let interval_ms = poll_interval_with_jitter_ms();
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            wait_for_next_poll_window(&poll_wake_rx, interval_ms).await;
         }
     });
 
@@ -151,7 +191,7 @@ fn run_command_polling_worker(
 
 async fn handle_polled_command(
     hub_device_id: &str,
-    client: &mut HubClient,
+    jwt: &str,
     dispatch_tx: &mpsc::SyncSender<MotorDispatchRequest>,
     command_dedup: &mut CommandDedupSet,
     radio_memory_gate: &RadioMemoryGate,
@@ -188,7 +228,7 @@ async fn handle_polled_command(
             command.expires_at
         );
         ack_best_effort(
-            client,
+            jwt,
             radio_memory_gate,
             &command_id,
             hub_device_id,
@@ -214,7 +254,7 @@ async fn handle_polled_command(
                     duration_ms,
                 );
                 ack_best_effort(
-                    client,
+                    jwt,
                     radio_memory_gate,
                     &command_id,
                     hub_device_id,
@@ -240,7 +280,7 @@ async fn handle_polled_command(
                 raw_action,
             );
             ack_best_effort(
-                client,
+                jwt,
                 radio_memory_gate,
                 &command_id,
                 hub_device_id,
@@ -275,7 +315,7 @@ async fn handle_polled_command(
             e,
         );
         ack_best_effort(
-            client,
+            jwt,
             radio_memory_gate,
             &command_id,
             hub_device_id,
@@ -300,7 +340,7 @@ async fn handle_polled_command(
                 MotorCommandReasonCode::None.as_str_name(),
             );
             ack_best_effort(
-                client,
+                jwt,
                 radio_memory_gate,
                 &command_id,
                 hub_device_id,
@@ -321,7 +361,7 @@ async fn handle_polled_command(
                 MotorCommandReasonCode::ProbeUnreachable.as_str_name(),
             );
             ack_best_effort(
-                client,
+                jwt,
                 radio_memory_gate,
                 &command_id,
                 hub_device_id,
@@ -342,7 +382,7 @@ async fn handle_polled_command(
                 MotorCommandReasonCode::Expired.as_str_name(),
             );
             ack_best_effort(
-                client,
+                jwt,
                 radio_memory_gate,
                 &command_id,
                 hub_device_id,
@@ -364,7 +404,7 @@ async fn handle_polled_command(
                 message,
             );
             ack_best_effort(
-                client,
+                jwt,
                 radio_memory_gate,
                 &command_id,
                 hub_device_id,
@@ -385,7 +425,7 @@ async fn handle_polled_command(
                 MotorCommandReasonCode::BleWriteFailed.as_str_name(),
             );
             ack_best_effort(
-                client,
+                jwt,
                 radio_memory_gate,
                 &command_id,
                 hub_device_id,
@@ -406,7 +446,7 @@ async fn handle_polled_command(
                 MotorCommandReasonCode::BleWriteFailed.as_str_name(),
             );
             ack_best_effort(
-                client,
+                jwt,
                 radio_memory_gate,
                 &command_id,
                 hub_device_id,
@@ -440,7 +480,7 @@ enum ParsedCommandAction {
 }
 
 async fn ack_best_effort(
-    client: &mut HubClient,
+    jwt: &str,
     radio_memory_gate: &RadioMemoryGate,
     command_id: &str,
     hub_id: &str,
@@ -451,6 +491,21 @@ async fn ack_best_effort(
 ) {
     let ack_result = {
         let _radio_memory_guard = radio_memory_gate.lock();
+        log_heap("before-command-ack-connect");
+        let mut client = match HubClient::connect_with_token(jwt).await {
+            Ok(client) => client,
+            Err(e) => {
+                error!(
+                    "command ack connect failed: command_id={} node_id={} status={} reason_code={} error={e:#}",
+                    command_id,
+                    node_id,
+                    status.as_str_name(),
+                    reason_code.as_str_name(),
+                );
+                return;
+            }
+        };
+
         log_heap("before-command-ack-rpc");
         client
             .ack_motor_command_event(
@@ -573,4 +628,20 @@ fn poll_interval_with_jitter_ms() -> u64 {
     let span = jitter.saturating_mul(2).saturating_add(1);
     let offset = (now % span) as i64 - jitter as i64;
     base.saturating_add_signed(offset)
+}
+
+async fn wait_for_next_poll_window(poll_wake_rx: &mpsc::Receiver<()>, interval_ms: u64) {
+    let mut waited_ms = 0;
+
+    while waited_ms < interval_ms {
+        match poll_wake_rx.try_recv() {
+            Ok(()) => return,
+            Err(mpsc::TryRecvError::Disconnected) => return,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        let sleep_ms = POLL_WAKE_CHECK_MS.min(interval_ms.saturating_sub(waited_ms));
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        waited_ms = waited_ms.saturating_add(sleep_ms);
+    }
 }

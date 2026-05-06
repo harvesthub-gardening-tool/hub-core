@@ -16,10 +16,14 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
 const API_URL: &str = env!("API_URL");
+const GRPC_CONNECT_TIMEOUT_SECS: u64 = 4;
+const GRPC_RPC_TIMEOUT_SECS: u64 = 6;
 const GRPC_CHANNEL_BUFFER_SIZE: usize = 8;
 const GRPC_CONCURRENCY_LIMIT: usize = 1;
 const GRPC_MAX_ENCODING_MESSAGE_SIZE: usize = 512;
 const GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 4096;
+const GRPC_HTTP2_INITIAL_WINDOW_SIZE: u32 = 16 * 1024;
+const GRPC_HTTP2_MAX_HEADER_LIST_SIZE: u32 = 4 * 1024;
 const GRPC_CODEC_BUFFER_SIZE: usize = 256;
 const GRPC_CODEC_YIELD_THRESHOLD: usize = 1024;
 
@@ -53,10 +57,13 @@ pub struct SensorData<'a> {
 impl HubClient {
     pub async fn connect_with_token(token: &str) -> Result<Self> {
         let channel = Endpoint::from_static(API_URL)
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .timeout(std::time::Duration::from_secs(20))
+            .connect_timeout(std::time::Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(GRPC_RPC_TIMEOUT_SECS))
             .buffer_size(GRPC_CHANNEL_BUFFER_SIZE)
             .concurrency_limit(GRPC_CONCURRENCY_LIMIT)
+            .initial_stream_window_size(GRPC_HTTP2_INITIAL_WINDOW_SIZE)
+            .initial_connection_window_size(GRPC_HTTP2_INITIAL_WINDOW_SIZE)
+            .http2_max_header_list_size(GRPC_HTTP2_MAX_HEADER_LIST_SIZE)
             .connect()
             .await?;
 

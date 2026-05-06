@@ -24,7 +24,6 @@ const HUB_NAME: &str = env!("HUB_NAME");
 const SCAN_WAIT_SECONDS: u64 = 30;
 const UPLINK_THREAD_STACK: usize = 32 * 1024;
 const UPLINK_QUEUE_DEPTH: usize = 16;
-const GRPC_CONNECT_MAX_ATTEMPTS: u8 = 3;
 const GRPC_SEND_MAX_ATTEMPTS: u8 = 3;
 const GRPC_RETRY_BACKOFF_MS: u64 = 500;
 const MOTOR_DISPATCH_QUEUE_DEPTH: usize = 8;
@@ -97,15 +96,26 @@ fn main() -> Result<()> {
     let (motor_dispatch_tx, motor_dispatch_rx) =
         mpsc::sync_channel::<polling::MotorDispatchRequest>(MOTOR_DISPATCH_QUEUE_DEPTH);
     let (tx, rx) = mpsc::sync_channel::<SensorReading>(UPLINK_QUEUE_DEPTH);
+    let (poll_wake_tx, poll_wake_rx) = mpsc::sync_channel::<()>(1);
     let radio_memory_gate = polling::RadioMemoryGate::default();
+    let poll_readiness = polling::PollReadiness::default();
     spawn_uplink_worker(rx, jwt.clone(), radio_memory_gate.clone())?;
     polling::spawn_command_polling_worker(
         hub_device_id.clone(),
         jwt,
         motor_dispatch_tx,
         radio_memory_gate.clone(),
+        poll_readiness.clone(),
+        poll_wake_rx,
     )?;
     log_heap("after-workers-spawned");
+
+    if poll_readiness.wait_for_first_poll() {
+        info!("[BOOT] first command poll finished before BLE scan startup");
+    } else {
+        warn!("[BOOT] first command poll did not finish before BLE scan startup timeout");
+    }
+    log_heap("after-first-command-poll-window");
 
     info!("[BOOT] BLE device ready");
 
@@ -119,6 +129,7 @@ fn main() -> Result<()> {
             Ok(v) => v,
             Err(e) => {
                 error!("scan_probe_candidates failed: {e:#}");
+                signal_command_poll_window(&poll_wake_tx);
                 sleep_with_motor_dispatch(
                     ble_device,
                     &motor_dispatch_rx,
@@ -151,6 +162,7 @@ fn main() -> Result<()> {
 
         if candidates.is_empty() {
             info!("No probe found this cycle, waiting {SCAN_WAIT_SECONDS}s...");
+            signal_command_poll_window(&poll_wake_tx);
             sleep_with_motor_dispatch(
                 ble_device,
                 &motor_dispatch_rx,
@@ -240,12 +252,23 @@ fn main() -> Result<()> {
         }
 
         info!("Polling cycle done. Waiting {SCAN_WAIT_SECONDS}s...");
+        signal_command_poll_window(&poll_wake_tx);
         sleep_with_motor_dispatch(
             ble_device,
             &motor_dispatch_rx,
             &radio_memory_gate,
             Duration::from_secs(SCAN_WAIT_SECONDS),
         );
+    }
+}
+
+fn signal_command_poll_window(poll_wake_tx: &mpsc::SyncSender<()>) {
+    match poll_wake_tx.try_send(()) {
+        Ok(()) => info!("command poll wake signalled for post-scan quiet window"),
+        Err(mpsc::TrySendError::Full(_)) => {
+            info!("command poll wake already pending for post-scan quiet window")
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => warn!("command poll wake channel disconnected"),
     }
 }
 
@@ -437,95 +460,61 @@ fn run_uplink_worker(
         .build()?;
 
     rt.block_on(async move {
-        let mut client: Option<grpc::HubClient> = None;
-
         while let Ok(reading) = rx.recv() {
             let mut delivered = false;
 
             for send_attempt in 1..=GRPC_SEND_MAX_ATTEMPTS {
-                if client.is_none() {
-                    for connect_attempt in 1..=GRPC_CONNECT_MAX_ATTEMPTS {
-                        let connect_result = {
-                            let _guard = radio_memory_gate.lock();
-                            log_heap("before-uplink-connect");
-                            grpc::HubClient::connect_with_token(&jwt).await
-                        };
-
-                        match connect_result {
-                            Ok(c) => {
-                                info!(
-                                    "gRPC client connected (attempt {}/{})",
-                                    connect_attempt,
-                                    GRPC_CONNECT_MAX_ATTEMPTS
-                                );
-                                client = Some(c);
-                                break;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "gRPC connect attempt {}/{} failed: {e:#}",
-                                    connect_attempt,
-                                    GRPC_CONNECT_MAX_ATTEMPTS
-                                );
-                                if connect_attempt < GRPC_CONNECT_MAX_ATTEMPTS {
-                                    tokio::time::sleep(Duration::from_millis(GRPC_RETRY_BACKOFF_MS))
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-
-                    if client.is_none() {
-                        error!(
-                            "gRPC connect failed after {} attempts, dropping reading",
-                            GRPC_CONNECT_MAX_ATTEMPTS
-                        );
-                        break;
-                    }
-                }
-
-                if let Some(c) = client.as_mut() {
-                    let send_result = {
-                        let _guard = radio_memory_gate.lock();
-                        log_heap("before-uplink-send");
-                        c.send_data(grpc::SensorData {
-                            node_id: &reading.node_id,
-                            air_temperature: reading.air_temperature_c,
-                            air_pressure: reading.air_pressure_pa,
-                            air_humidity: reading.air_humidity_pct,
-                            soil_temperature: reading.soil_temperature_c,
-                            soil_humidity: reading.soil_humidity_pct,
-                            timestamp: reading.timestamp_unix,
-                        })
-                        .await
-                    };
-
-                    match send_result {
-                        Ok(()) => {
-                            info!(
-                                "uplink ok: node={} air_temp={:.2} air_pressure={:.0} air_hum={:.2} soil_temp={:.2} soil_hum={:.2} ts={}",
-                                reading.node_id,
-                                reading.air_temperature_c,
-                                reading.air_pressure_pa,
-                                reading.air_humidity_pct,
-                                reading.soil_temperature_c,
-                                reading.soil_humidity_pct,
-                                reading.timestamp_unix
-                            );
-                            delivered = true;
-                            break;
+                let send_result = {
+                    let _guard = radio_memory_gate.lock();
+                    log_heap("before-uplink-connect");
+                    match grpc::HubClient::connect_with_token(&jwt).await {
+                        Ok(client) => {
+                            let mut client = client;
+                            log_heap("before-uplink-send");
+                            client
+                                .send_data(grpc::SensorData {
+                                    node_id: &reading.node_id,
+                                    air_temperature: reading.air_temperature_c,
+                                    air_pressure: reading.air_pressure_pa,
+                                    air_humidity: reading.air_humidity_pct,
+                                    soil_temperature: reading.soil_temperature_c,
+                                    soil_humidity: reading.soil_humidity_pct,
+                                    timestamp: reading.timestamp_unix,
+                                })
+                                .await
                         }
                         Err(e) => {
                             error!(
-                                "uplink attempt {}/{} failed: {e:#}; dropping client to force reconnect",
-                                send_attempt,
-                                GRPC_SEND_MAX_ATTEMPTS
+                                "gRPC connect failed for uplink attempt {}/{}: {e:#}",
+                                send_attempt, GRPC_SEND_MAX_ATTEMPTS
                             );
-                            client = None;
-                            if send_attempt < GRPC_SEND_MAX_ATTEMPTS {
-                                tokio::time::sleep(Duration::from_millis(GRPC_RETRY_BACKOFF_MS))
-                                    .await;
-                            }
+                            Err(e)
+                        }
+                    }
+                };
+
+                match send_result {
+                    Ok(()) => {
+                        info!(
+                            "uplink ok: node={} air_temp={:.2} air_pressure={:.0} air_hum={:.2} soil_temp={:.2} soil_hum={:.2} ts={}",
+                            reading.node_id,
+                            reading.air_temperature_c,
+                            reading.air_pressure_pa,
+                            reading.air_humidity_pct,
+                            reading.soil_temperature_c,
+                            reading.soil_humidity_pct,
+                            reading.timestamp_unix
+                        );
+                        delivered = true;
+                        break;
+                    }
+                    Err(e) => {
+                        error!(
+                            "uplink attempt {}/{} failed: {e:#}",
+                            send_attempt, GRPC_SEND_MAX_ATTEMPTS
+                        );
+                        if send_attempt < GRPC_SEND_MAX_ATTEMPTS {
+                            tokio::time::sleep(Duration::from_millis(GRPC_RETRY_BACKOFF_MS)).await;
                         }
                     }
                 }
