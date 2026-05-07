@@ -80,6 +80,49 @@ pub(crate) struct ProbeMotorResult {
     pub(crate) command_id: [u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
 }
 
+impl ProbeMotorResult {
+    pub(crate) fn status_label(&self) -> &'static str {
+        match self.status {
+            3 => "SENT_TO_PROBE",
+            4 => "EXECUTING",
+            5 => "SUCCEEDED",
+            6 => "FAILED",
+            7 => "EXPIRED",
+            _ => "UNKNOWN",
+        }
+    }
+
+    pub(crate) fn reason_label(&self) -> &'static str {
+        match self.reason_code {
+            1 => "NONE",
+            3 => "EXPIRED",
+            7 => "UART_TIMEOUT",
+            8 => "UART_REJECTED",
+            _ => "UNKNOWN",
+        }
+    }
+
+    pub(crate) fn command_id_label(&self) -> String {
+        let mut output = String::with_capacity(36);
+        for (index, byte) in self.command_id.iter().enumerate() {
+            if matches!(index, 4 | 6 | 8 | 10) {
+                output.push('-');
+            }
+            output.push(nibble_to_hex(byte >> 4));
+            output.push(nibble_to_hex(byte & 0x0f));
+        }
+        output
+    }
+}
+
+fn nibble_to_hex(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + (nibble - 10)) as char,
+        _ => '0',
+    }
+}
+
 pub fn init_device() -> &'static mut BLEDevice {
     BLEDevice::take()
 }

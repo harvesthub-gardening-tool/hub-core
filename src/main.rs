@@ -193,9 +193,21 @@ fn main() -> Result<()> {
                 ))
             }) {
                 Ok(Some(session)) => {
+                    let probe_result_log = session
+                        .last_motor_result
+                        .as_ref()
+                        .map(|result| {
+                            format!(
+                                " motor_status={} motor_reason={} motor_command_id={}",
+                                result.status_label(),
+                                result.reason_label(),
+                                result.command_id_label(),
+                            )
+                        })
+                        .unwrap_or_default();
                     let reading = session.reading;
                     info!(
-                        "probe reading: addr={:?} probe_uuid={} name='{}' version={}.{} air_temp={:.2}°C air_pressure={:.0}Pa air_hum={:.2}% soil_temp={:.2}°C soil_hum={:.2}% ts={}",
+                        "probe reading: addr={:?} probe_uuid={} name='{}' version={}.{} air_temp={:.2}°C air_pressure={:.0}Pa air_hum={:.2}% soil_temp={:.2}°C soil_hum={:.2}% ts={}{}",
                         candidate.device.addr(),
                         reading.probe_uuid.as_str(),
                         candidate.meta.name,
@@ -206,7 +218,8 @@ fn main() -> Result<()> {
                         reading.air_humidity_pct,
                         reading.soil_temperature_c,
                         reading.soil_humidity_pct,
-                        reading.timestamp
+                        reading.timestamp,
+                        probe_result_log,
                     );
                     let msg = SensorReading {
                         node_id: reading.probe_uuid.clone(),
