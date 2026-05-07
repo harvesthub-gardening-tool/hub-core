@@ -1,4 +1,4 @@
-use crate::ble::MotorDispatchFailure;
+use crate::ble::{MotorDispatchFailure, ProbeMotorResult};
 use crate::config;
 use crate::grpc::HubClient;
 use anyhow::Result;
@@ -114,6 +114,69 @@ impl CommandPoller {
         }
 
         self.pending = remaining;
+    }
+
+    pub(crate) fn apply_probe_motor_result(
+        &mut self,
+        hub_device_id: &str,
+        jwt: &str,
+        radio_memory_gate: &RadioMemoryGate,
+        probe_uuid: &str,
+        probe_result: ProbeMotorResult,
+    ) {
+        let Some(command_id) = expand_command_id(&probe_result.command_id) else {
+            return;
+        };
+
+        let (status, reason_code, reason_message) = match probe_result.status {
+            4 => (
+                MotorCommandStatus::Executing,
+                MotorCommandReasonCode::None,
+                "probe started executing motor command",
+            ),
+            5 => (
+                MotorCommandStatus::Succeeded,
+                MotorCommandReasonCode::None,
+                "probe completed motor command successfully",
+            ),
+            6 => (
+                MotorCommandStatus::Failed,
+                match probe_result.reason_code {
+                    7 => MotorCommandReasonCode::UartTimeout,
+                    8 => MotorCommandReasonCode::UartRejected,
+                    _ => MotorCommandReasonCode::BleWriteFailed,
+                },
+                "probe reported motor command failure",
+            ),
+            7 => (
+                MotorCommandStatus::Expired,
+                MotorCommandReasonCode::Expired,
+                "probe reported command expired before execution",
+            ),
+            _ => return,
+        };
+
+        let ack_sent = ack_best_effort(
+            jwt,
+            radio_memory_gate,
+            &command_id,
+            hub_device_id,
+            probe_uuid,
+            status,
+            reason_code,
+            reason_message,
+        );
+        if ack_sent {
+            self.command_dedup.finish_processed(&command_id);
+        } else {
+            warn!(
+                "probe motor result ack failed, keeping local retry path alive: command_id={} node_id={} status={} reason_code={}",
+                command_id,
+                probe_uuid,
+                status.as_str_name(),
+                reason_code.as_str_name(),
+            );
+        }
     }
 
     fn store_polled_command(
@@ -377,6 +440,29 @@ fn pull_commands_once(
             )
             .await
     })
+}
+
+fn expand_command_id(command_id: &[u8; 16]) -> Option<String> {
+    let mut output = String::with_capacity(36);
+
+    for (index, byte) in command_id.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            output.push('-');
+        }
+
+        output.push(hex_digit(byte >> 4));
+        output.push(hex_digit(byte & 0x0f));
+    }
+
+    Some(output)
+}
+
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + (nibble - 10)) as char,
+        _ => '0',
+    }
 }
 
 fn parse_command_action(command: &MotorCommand) -> ParsedCommandAction {

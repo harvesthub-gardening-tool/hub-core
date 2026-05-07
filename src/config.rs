@@ -17,6 +17,7 @@ pub const SOIL_TEMP_CHAR_UUID: &str = "12340003-0000-1000-8000-00805f9b34fb";
 pub const SOIL_HUM_CHAR_UUID: &str = "12340004-0000-1000-8000-00805f9b34fb";
 pub const PROBE_SETUP_CONFIRM_CHAR_UUID: &str = "12340005-0000-1000-8000-00805f9b34fb";
 pub const MOTOR_COMMAND_CHAR_UUID: &str = "12340006-0000-1000-8000-00805f9b34fb";
+pub const MOTOR_RESULT_CHAR_UUID: &str = "12340007-0000-1000-8000-00805f9b34fb";
 pub const PROBE_SETUP_CONFIRM_MAGIC: &[u8] = b"HHSETUP1";
 
 // Motor command write payload layout (little-endian fixed-width fields):
@@ -46,6 +47,21 @@ pub const MOTOR_COMMAND_PAYLOAD_LEN: usize = 30;
 pub const MOTOR_COMMAND_MAX_DURATION_MS: u32 = 5_000;
 pub const MOTOR_COMMAND_DEFAULT_EXPIRY_MS: u32 = 300_000;
 pub const MOTOR_COMMAND_DUPLICATE_RETENTION_MS: u32 = MOTOR_COMMAND_DEFAULT_EXPIRY_MS;
+
+// Probe motor-result payload layout (little-endian fixed-width fields):
+// [0..4]  magic      = MOTOR_RESULT_PAYLOAD_MAGIC
+// [4]     version    = MOTOR_RESULT_PAYLOAD_VERSION
+// [5]     status     = control.v1.MotorCommandStatus numeric value
+// [6]     reason     = control.v1.MotorCommandReasonCode numeric value
+// [7..23] command_id = 16-byte compact UUID bytes
+pub const MOTOR_RESULT_PAYLOAD_MAGIC: &[u8; 4] = b"HHMR";
+pub const MOTOR_RESULT_PAYLOAD_VERSION: u8 = 1;
+pub const MOTOR_RESULT_PAYLOAD_MAGIC_OFFSET: usize = 0;
+pub const MOTOR_RESULT_PAYLOAD_VERSION_OFFSET: usize = 4;
+pub const MOTOR_RESULT_PAYLOAD_STATUS_OFFSET: usize = 5;
+pub const MOTOR_RESULT_PAYLOAD_REASON_OFFSET: usize = 6;
+pub const MOTOR_RESULT_PAYLOAD_COMMAND_ID_OFFSET: usize = 7;
+pub const MOTOR_RESULT_PAYLOAD_LEN: usize = 23;
 
 // Backend motor command poll payload defaults.
 pub const MOTOR_COMMAND_POLL_LEASE_DURATION_MS: i32 = 300_000;

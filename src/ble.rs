@@ -6,9 +6,12 @@ use crate::config::{
     MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN, MOTOR_COMMAND_PAYLOAD_COMMAND_ID_OFFSET,
     MOTOR_COMMAND_PAYLOAD_DURATION_MS_OFFSET, MOTOR_COMMAND_PAYLOAD_EXPIRY_MS_OFFSET,
     MOTOR_COMMAND_PAYLOAD_LEN, MOTOR_COMMAND_PAYLOAD_MAGIC, MOTOR_COMMAND_PAYLOAD_MAGIC_OFFSET,
-    MOTOR_COMMAND_PAYLOAD_VERSION, MOTOR_COMMAND_PAYLOAD_VERSION_OFFSET,
-    PROBE_SETUP_CONFIRM_CHAR_UUID, PROBE_SETUP_CONFIRM_MAGIC, PROBE_UUID_CHAR_UUID, SETUP_MARKER,
-    SETUP_PROBE_NAME, SOIL_HUM_CHAR_UUID, SOIL_TEMP_CHAR_UUID,
+    MOTOR_COMMAND_PAYLOAD_VERSION, MOTOR_COMMAND_PAYLOAD_VERSION_OFFSET, MOTOR_RESULT_CHAR_UUID,
+    MOTOR_RESULT_PAYLOAD_COMMAND_ID_OFFSET, MOTOR_RESULT_PAYLOAD_LEN, MOTOR_RESULT_PAYLOAD_MAGIC,
+    MOTOR_RESULT_PAYLOAD_MAGIC_OFFSET, MOTOR_RESULT_PAYLOAD_REASON_OFFSET,
+    MOTOR_RESULT_PAYLOAD_STATUS_OFFSET, MOTOR_RESULT_PAYLOAD_VERSION,
+    MOTOR_RESULT_PAYLOAD_VERSION_OFFSET, PROBE_SETUP_CONFIRM_CHAR_UUID, PROBE_SETUP_CONFIRM_MAGIC,
+    PROBE_UUID_CHAR_UUID, SETUP_MARKER, SETUP_PROBE_NAME, SOIL_HUM_CHAR_UUID, SOIL_TEMP_CHAR_UUID,
 };
 use crate::time;
 use anyhow::{bail, Context};
@@ -33,6 +36,7 @@ pub(crate) struct ProbeReading {
 pub(crate) struct ProbeSessionResult {
     pub(crate) reading: ProbeReading,
     pub(crate) motor_dispatch_result: Option<Result<(), MotorDispatchFailure>>,
+    pub(crate) last_motor_result: Option<ProbeMotorResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +71,13 @@ pub(crate) struct SetupProbe {
 pub(crate) enum MotorDispatchFailure {
     Expired,
     BleWriteFailed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbeMotorResult {
+    pub(crate) status: u8,
+    pub(crate) reason_code: u8,
+    pub(crate) command_id: [u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
 }
 
 pub fn init_device() -> &'static mut BLEDevice {
@@ -326,11 +337,14 @@ pub(crate) async fn read_probe_and_maybe_dispatch_motor(
             None
         };
 
+    let last_motor_result = read_motor_result_from_service(service).await.ok().flatten();
+
     let _ = client.disconnect();
 
     Ok(Some(ProbeSessionResult {
         reading,
         motor_dispatch_result,
+        last_motor_result,
     }))
 }
 
@@ -438,6 +452,55 @@ async fn write_motor_payload_to_service(
     }
 
     Ok(())
+}
+
+async fn read_motor_result_from_service(
+    service: &mut BLERemoteService,
+) -> anyhow::Result<Option<ProbeMotorResult>> {
+    let characteristic = match service
+        .get_characteristic(uuid128!(MOTOR_RESULT_CHAR_UUID))
+        .await
+    {
+        Ok(characteristic) => characteristic,
+        Err(_) => return Ok(None),
+    };
+
+    let raw = characteristic
+        .read_value()
+        .await
+        .context("motor result read failed")?;
+
+    parse_motor_result_payload(&raw)
+}
+
+fn parse_motor_result_payload(raw: &[u8]) -> anyhow::Result<Option<ProbeMotorResult>> {
+    if raw.len() != MOTOR_RESULT_PAYLOAD_LEN {
+        return Ok(None);
+    }
+
+    if &raw[MOTOR_RESULT_PAYLOAD_MAGIC_OFFSET..MOTOR_RESULT_PAYLOAD_VERSION_OFFSET]
+        != MOTOR_RESULT_PAYLOAD_MAGIC
+    {
+        return Ok(None);
+    }
+
+    if raw[MOTOR_RESULT_PAYLOAD_VERSION_OFFSET] != MOTOR_RESULT_PAYLOAD_VERSION {
+        return Ok(None);
+    }
+
+    let mut command_id = [0u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN];
+    command_id
+        .copy_from_slice(&raw[MOTOR_RESULT_PAYLOAD_COMMAND_ID_OFFSET..MOTOR_RESULT_PAYLOAD_LEN]);
+
+    if command_id.iter().all(|byte| *byte == 0) {
+        return Ok(None);
+    }
+
+    Ok(Some(ProbeMotorResult {
+        status: raw[MOTOR_RESULT_PAYLOAD_STATUS_OFFSET],
+        reason_code: raw[MOTOR_RESULT_PAYLOAD_REASON_OFFSET],
+        command_id,
+    }))
 }
 
 async fn read_probe_from_service(
