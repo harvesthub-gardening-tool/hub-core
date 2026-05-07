@@ -110,13 +110,15 @@ impl CommandPoller {
                 continue;
             }
 
-            self.dispatch_pending_command(
+            if let Some(command) = self.dispatch_pending_command(
                 hub_device_id,
                 jwt,
                 radio_memory_gate,
                 command,
                 &mut dispatch_motor,
-            );
+            ) {
+                remaining.push(command);
+            }
         }
 
         self.pending = remaining;
@@ -246,7 +248,7 @@ impl CommandPoller {
         dispatch_motor: &mut impl FnMut(
             MotorDispatchRequest,
         ) -> std::result::Result<(), MotorDispatchFailure>,
-    ) {
+    ) -> Option<PendingMotorCommand> {
         let request = MotorDispatchRequest {
             command_id: command.command_id.clone(),
             action: command.action,
@@ -264,7 +266,7 @@ impl CommandPoller {
                     MotorCommandStatus::SentToProbe.as_str_name(),
                     MotorCommandReasonCode::None.as_str_name(),
                 );
-                ack_best_effort(
+                let ack_sent = ack_best_effort(
                     jwt,
                     radio_memory_gate,
                     &command.command_id,
@@ -274,7 +276,18 @@ impl CommandPoller {
                     MotorCommandReasonCode::None,
                     "motor command write acknowledged by probe",
                 );
-                self.command_dedup.finish_processed(&command.command_id);
+                if ack_sent {
+                    self.command_dedup.finish_processed(&command.command_id);
+                    None
+                } else {
+                    warn!(
+                        "motor dispatch ack failed, keeping command retryable until TTL expiry: command_id={} node_id={} expires_at={}",
+                        command.command_id,
+                        command.node_id,
+                        command.expires_at_epoch_ms,
+                    );
+                    Some(command)
+                }
             }
             Err(MotorDispatchFailure::Expired) => {
                 warn!(
@@ -295,27 +308,18 @@ impl CommandPoller {
                     "command expired before BLE write",
                 );
                 self.command_dedup.finish_processed(&command.command_id);
+                None
             }
             Err(MotorDispatchFailure::BleWriteFailed(message)) => {
                 warn!(
-                    "motor dispatch BLE failure: command_id={} node_id={} dispatch_status=ble_write_failed ack_status={} reason_code={} detail={}",
+                    "motor dispatch BLE failure, keeping pending until TTL expiry: command_id={} node_id={} dispatch_status=ble_write_failed reason_code={} expires_at={} detail={}",
                     command.command_id,
                     command.node_id,
-                    MotorCommandStatus::Failed.as_str_name(),
                     MotorCommandReasonCode::BleWriteFailed.as_str_name(),
+                    command.expires_at_epoch_ms,
                     message,
                 );
-                ack_best_effort(
-                    jwt,
-                    radio_memory_gate,
-                    &command.command_id,
-                    hub_device_id,
-                    &command.node_id,
-                    MotorCommandStatus::Failed,
-                    MotorCommandReasonCode::BleWriteFailed,
-                    &message,
-                );
-                self.command_dedup.finish_processed(&command.command_id);
+                Some(command)
             }
         }
     }
@@ -410,7 +414,7 @@ fn ack_best_effort(
     status: MotorCommandStatus,
     reason_code: MotorCommandReasonCode,
     reason_message: &str,
-) {
+) -> bool {
     let ack_result = ack_once(
         jwt,
         radio_memory_gate,
@@ -430,6 +434,7 @@ fn ack_best_effort(
             status.as_str_name(),
             reason_code.as_str_name(),
         );
+        false
     } else {
         info!(
             "command ack sent: command_id={} node_id={} status={} reason_code={} reason_message={}",
@@ -439,6 +444,7 @@ fn ack_best_effort(
             reason_code.as_str_name(),
             reason_message,
         );
+        true
     }
 }
 
