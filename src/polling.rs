@@ -40,6 +40,7 @@ impl RadioMemoryGate {
 pub(crate) struct CommandPoller {
     command_dedup: CommandDedupSet,
     pending: Vec<PendingMotorCommand>,
+    applied_probe_results: HashSet<String>,
 }
 
 impl CommandPoller {
@@ -128,6 +129,10 @@ impl CommandPoller {
             return;
         };
 
+        if self.applied_probe_results.contains(&command_id) {
+            return;
+        }
+
         let (status, reason_code, reason_message) = match probe_result.status {
             4 => (
                 MotorCommandStatus::Executing,
@@ -168,6 +173,7 @@ impl CommandPoller {
         );
         if ack_sent {
             self.command_dedup.finish_processed(&command_id);
+            self.applied_probe_results.insert(command_id);
         } else {
             warn!(
                 "probe motor result ack failed, keeping local retry path alive: command_id={} node_id={} status={} reason_code={}",

@@ -231,6 +231,11 @@ fn main() -> Result<()> {
                         timestamp_unix: reading.timestamp,
                     };
                     upload_reading(&jwt, &radio_memory_gate, &msg);
+                    let probe_result_is_terminal = session
+                        .last_motor_result
+                        .as_ref()
+                        .map(|result| result.is_terminal())
+                        .unwrap_or(false);
                     if let Some(probe_result) = session.last_motor_result {
                         command_poller.apply_probe_motor_result(
                             &hub_device_id,
@@ -240,14 +245,16 @@ fn main() -> Result<()> {
                             probe_result,
                         );
                     }
-                    if let Some(result) = session.motor_dispatch_result {
-                        command_poller.complete_dispatched_for_probe(
-                            &hub_device_id,
-                            &jwt,
-                            &radio_memory_gate,
-                            reading.probe_uuid.as_str(),
-                            result,
-                        );
+                    if !probe_result_is_terminal {
+                        if let Some(result) = session.motor_dispatch_result {
+                            command_poller.complete_dispatched_for_probe(
+                                &hub_device_id,
+                                &jwt,
+                                &radio_memory_gate,
+                                reading.probe_uuid.as_str(),
+                                result,
+                            );
+                        }
                     }
                 }
                 Ok(None) => info!(

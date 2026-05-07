@@ -113,6 +113,10 @@ impl ProbeMotorResult {
         }
         output
     }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self.status, 5..=7)
+    }
 }
 
 fn nibble_to_hex(nibble: u8) -> char {
