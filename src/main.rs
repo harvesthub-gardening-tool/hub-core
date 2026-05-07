@@ -175,9 +175,25 @@ fn main() -> Result<()> {
             }
 
             match run_with_radio_memory_gate(&radio_memory_gate, || {
-                block_on(ble::read_probe_from_device(ble_device, &candidate.device))
+                block_on(ble::read_probe_and_maybe_dispatch_motor(
+                    ble_device,
+                    &candidate.device,
+                    |probe_uuid| {
+                        command_poller
+                            .peek_pending_for_probe_uuid(probe_uuid)
+                            .map(|request| {
+                                (
+                                    request.command_id,
+                                    request.action,
+                                    request.duration_ms,
+                                    request.expires_at_epoch_ms,
+                                )
+                            })
+                    },
+                ))
             }) {
-                Ok(Some(reading)) => {
+                Ok(Some(session)) => {
+                    let reading = session.reading;
                     info!(
                         "probe reading: addr={:?} probe_uuid={} name='{}' version={}.{} air_temp={:.2}°C air_pressure={:.0}Pa air_hum={:.2}% soil_temp={:.2}°C soil_hum={:.2}% ts={}",
                         candidate.device.addr(),
@@ -202,15 +218,15 @@ fn main() -> Result<()> {
                         timestamp_unix: reading.timestamp,
                     };
                     upload_reading(&jwt, &radio_memory_gate, &msg);
-                    dispatch_pending_commands_for_probe(
-                        ble_device,
-                        candidate,
-                        &mut command_poller,
-                        &hub_device_id,
-                        &jwt,
-                        &radio_memory_gate,
-                        reading.probe_uuid.as_str(),
-                    );
+                    if let Some(result) = session.motor_dispatch_result {
+                        command_poller.complete_dispatched_for_probe(
+                            &hub_device_id,
+                            &jwt,
+                            &radio_memory_gate,
+                            reading.probe_uuid.as_str(),
+                            result,
+                        );
+                    }
                 }
                 Ok(None) => info!(
                     "skip addr={:?} name='{}': probe service/chars not readable",
@@ -246,35 +262,6 @@ fn poll_commands_in_quiet_window(
     info!("command poll quiet window starting");
     command_poller.poll_once(hub_device_id, jwt, radio_memory_gate);
     info!("command poll quiet window finished");
-}
-
-fn dispatch_pending_commands_for_probe(
-    ble_device: &esp32_nimble::BLEDevice,
-    candidate: &ble::ProbeCandidate,
-    command_poller: &mut polling::CommandPoller,
-    hub_device_id: &str,
-    jwt: &str,
-    radio_memory_gate: &polling::RadioMemoryGate,
-    probe_uuid: &str,
-) {
-    command_poller.dispatch_pending_for_probe(
-        hub_device_id,
-        jwt,
-        radio_memory_gate,
-        probe_uuid,
-        |request| {
-            run_with_radio_memory_gate(radio_memory_gate, || {
-                block_on(ble::dispatch_motor_command_to_candidate(
-                    ble_device,
-                    candidate,
-                    &request.command_id,
-                    request.action,
-                    request.duration_ms,
-                    request.expires_at_epoch_ms,
-                ))
-            })
-        },
-    );
 }
 
 fn upload_reading(

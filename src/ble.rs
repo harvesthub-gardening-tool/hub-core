@@ -12,7 +12,7 @@ use crate::config::{
 };
 use crate::time;
 use anyhow::{bail, Context};
-use esp32_nimble::{uuid128, BLEAdvertisedDevice, BLEDevice, BLEScan};
+use esp32_nimble::{uuid128, BLEAdvertisedDevice, BLEDevice, BLERemoteService, BLEScan};
 use log::info;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -28,6 +28,11 @@ pub(crate) struct ProbeReading {
     pub(crate) soil_temperature_c: f64,
     pub(crate) soil_humidity_pct: f64,
     pub(crate) timestamp: i64,
+}
+
+pub(crate) struct ProbeSessionResult {
+    pub(crate) reading: ProbeReading,
+    pub(crate) motor_dispatch_result: Option<Result<(), MotorDispatchFailure>>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,23 +271,67 @@ pub(crate) fn build_motor_command_payload(
     Ok(payload)
 }
 
-pub(crate) async fn dispatch_motor_command_to_candidate(
+pub(crate) async fn read_probe_and_maybe_dispatch_motor(
     ble_device: &BLEDevice,
-    candidate: &ProbeCandidate,
-    command_id: &str,
-    action: u8,
-    duration_ms: i32,
-    expires_at_ms: i64,
-) -> Result<(), MotorDispatchFailure> {
-    write_motor_payload_to_candidate(
-        ble_device,
-        candidate,
-        command_id,
-        action,
-        duration_ms,
-        expires_at_ms,
-    )
-    .await
+    device: &BLEAdvertisedDevice,
+    resolve_motor_dispatch_request: impl FnOnce(&str) -> Option<(String, u8, i32, i64)>,
+) -> anyhow::Result<Option<ProbeSessionResult>> {
+    let mut client = ble_device.new_client();
+
+    client.on_connect(|client| {
+        let _ = client.update_conn_params(120, 120, 0, 60);
+    });
+
+    client.connect(&device.addr()).await?;
+    info!("BLE connected: {:?}", device.addr());
+
+    let service = match client
+        .get_service(uuid128!(ENVIRONMENTAL_SENSING_SERVICE_UUID))
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = client.disconnect();
+            return Ok(None);
+        }
+    };
+
+    let reading = match read_probe_from_service(service, device).await {
+        Ok(Some(reading)) => reading,
+        Ok(None) => {
+            let _ = client.disconnect();
+            return Ok(None);
+        }
+        Err(err) => {
+            let _ = client.disconnect();
+            return Err(err);
+        }
+    };
+
+    let motor_dispatch_request = resolve_motor_dispatch_request(reading.probe_uuid.as_str());
+
+    let motor_dispatch_result =
+        if let Some((command_id, action, duration_ms, expires_at_ms)) = motor_dispatch_request {
+            Some(
+                write_motor_payload_to_service(
+                    service,
+                    command_id.as_str(),
+                    action,
+                    duration_ms,
+                    expires_at_ms,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+    let _ = client.disconnect();
+
+    Ok(Some(ProbeSessionResult {
+        reading,
+        motor_dispatch_result,
+    }))
 }
 
 async fn read_setup_probe_identity(
@@ -350,46 +399,19 @@ async fn read_setup_probe_identity(
     })
 }
 
-async fn write_motor_payload_to_candidate(
-    ble_device: &BLEDevice,
-    candidate: &ProbeCandidate,
+async fn write_motor_payload_to_service(
+    service: &mut BLERemoteService,
     command_id: &str,
     action: u8,
     duration_ms: i32,
     expires_at_ms: i64,
 ) -> Result<(), MotorDispatchFailure> {
-    let mut client = ble_device.new_client();
-
-    client
-        .connect(&candidate.device.addr())
-        .await
-        .map_err(|e| {
-            MotorDispatchFailure::BleWriteFailed(format!(
-                "connect failed addr={:?}: {e:#}",
-                candidate.device.addr()
-            ))
-        })?;
-
-    let service = match client
-        .get_service(uuid128!(ENVIRONMENTAL_SENSING_SERVICE_UUID))
-        .await
-    {
-        Ok(service) => service,
-        Err(e) => {
-            let _ = client.disconnect();
-            return Err(MotorDispatchFailure::BleWriteFailed(format!(
-                "motor dispatch environmental service missing: {e:#}"
-            )));
-        }
-    };
-
     let characteristic = match service
         .get_characteristic(uuid128!(MOTOR_COMMAND_CHAR_UUID))
         .await
     {
         Ok(characteristic) => characteristic,
         Err(e) => {
-            let _ = client.disconnect();
             return Err(MotorDispatchFailure::BleWriteFailed(format!(
                 "motor command characteristic missing: {e:#}"
             )));
@@ -397,7 +419,6 @@ async fn write_motor_payload_to_candidate(
     };
 
     if expires_at_ms <= time::get_unix_now_ms() {
-        let _ = client.disconnect();
         return Err(MotorDispatchFailure::Expired);
     }
 
@@ -411,40 +432,18 @@ async fn write_motor_payload_to_candidate(
         })?;
 
     if let Err(e) = characteristic.write_value(&payload, true).await {
-        let _ = client.disconnect();
         return Err(MotorDispatchFailure::BleWriteFailed(format!(
             "motor command write failed: {e:#}"
         )));
     }
 
-    let _ = client.disconnect();
     Ok(())
 }
 
-pub(crate) async fn read_probe_from_device(
-    ble_device: &BLEDevice,
+async fn read_probe_from_service(
+    service: &mut BLERemoteService,
     device: &BLEAdvertisedDevice,
 ) -> anyhow::Result<Option<ProbeReading>> {
-    let mut client = ble_device.new_client();
-
-    client.on_connect(|client| {
-        let _ = client.update_conn_params(120, 120, 0, 60);
-    });
-
-    client.connect(&device.addr()).await?;
-    info!("BLE connected: {:?}", device.addr());
-
-    let service = match client
-        .get_service(uuid128!(ENVIRONMENTAL_SENSING_SERVICE_UUID))
-        .await
-    {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = client.disconnect();
-            return Ok(None);
-        }
-    };
-
     let air_temp_raw = match service
         .get_characteristic(uuid128!(AIR_TEMP_CHAR_UUID))
         .await
@@ -453,10 +452,7 @@ pub(crate) async fn read_probe_from_device(
             .read_value()
             .await
             .context("air temperature read failed")?,
-        Err(_) => {
-            let _ = client.disconnect();
-            return Ok(None);
-        }
+        Err(_) => return Ok(None),
     };
 
     let air_pressure_raw = match service
@@ -464,10 +460,7 @@ pub(crate) async fn read_probe_from_device(
         .await
     {
         Ok(chr) => chr.read_value().await.context("air pressure read failed")?,
-        Err(_) => {
-            let _ = client.disconnect();
-            return Ok(None);
-        }
+        Err(_) => return Ok(None),
     };
 
     let air_hum_raw = match service
@@ -475,10 +468,7 @@ pub(crate) async fn read_probe_from_device(
         .await
     {
         Ok(chr) => chr.read_value().await.context("air humidity read failed")?,
-        Err(_) => {
-            let _ = client.disconnect();
-            return Ok(None);
-        }
+        Err(_) => return Ok(None),
     };
 
     let soil_temp_raw = match service
@@ -489,10 +479,7 @@ pub(crate) async fn read_probe_from_device(
             .read_value()
             .await
             .context("soil temperature read failed")?,
-        Err(_) => {
-            let _ = client.disconnect();
-            return Ok(None);
-        }
+        Err(_) => return Ok(None),
     };
 
     let soil_hum_raw = match service
@@ -503,10 +490,7 @@ pub(crate) async fn read_probe_from_device(
             .read_value()
             .await
             .context("soil humidity read failed")?,
-        Err(_) => {
-            let _ = client.disconnect();
-            return Ok(None);
-        }
+        Err(_) => return Ok(None),
     };
 
     let probe_uuid = match service
@@ -531,8 +515,6 @@ pub(crate) async fn read_probe_from_device(
     let air_humidity_pct = parse_centi_percent_u16(&air_hum_raw, "air humidity")?;
     let soil_temperature_c = parse_centi_celsius_i16(&soil_temp_raw, "soil temperature")?;
     let soil_humidity_pct = parse_centi_percent_u16(&soil_hum_raw, "soil humidity")?;
-
-    let _ = client.disconnect();
 
     Ok(Some(ProbeReading {
         probe_uuid,

@@ -68,54 +68,46 @@ impl CommandPoller {
         }
     }
 
-    pub(crate) fn dispatch_pending_for_probe(
+    pub(crate) fn peek_pending_for_probe_uuid(
+        &self,
+        probe_uuid: &str,
+    ) -> Option<MotorDispatchRequest> {
+        self.pending
+            .iter()
+            .find(|command| command.node_id == probe_uuid)
+            .map(|command| MotorDispatchRequest {
+                command_id: command.command_id.clone(),
+                action: command.action,
+                duration_ms: command.duration_ms,
+                expires_at_epoch_ms: command.expires_at_epoch_ms,
+            })
+    }
+
+    pub(crate) fn complete_dispatched_for_probe(
         &mut self,
         hub_device_id: &str,
         jwt: &str,
         radio_memory_gate: &RadioMemoryGate,
         probe_uuid: &str,
-        mut dispatch_motor: impl FnMut(
-            MotorDispatchRequest,
-        ) -> std::result::Result<(), MotorDispatchFailure>,
+        dispatch_result: std::result::Result<(), MotorDispatchFailure>,
     ) {
         let mut remaining = Vec::with_capacity(self.pending.len());
         let pending = core::mem::take(&mut self.pending);
+        let mut consumed = false;
 
         for command in pending {
-            if command.node_id != probe_uuid {
+            if consumed || command.node_id != probe_uuid {
                 remaining.push(command);
                 continue;
             }
 
-            if pending_command_is_expired(&command) {
-                warn!(
-                    "pending motor command expired before probe availability: command_id={} node_id={} status={} reason_code={} expires_at={}",
-                    command.command_id,
-                    command.node_id,
-                    MotorCommandStatus::Expired.as_str_name(),
-                    MotorCommandReasonCode::Expired.as_str_name(),
-                    command.expires_at_epoch_ms,
-                );
-                ack_best_effort(
-                    jwt,
-                    radio_memory_gate,
-                    &command.command_id,
-                    hub_device_id,
-                    &command.node_id,
-                    MotorCommandStatus::Expired,
-                    MotorCommandReasonCode::Expired,
-                    "command expired before probe became available",
-                );
-                self.command_dedup.finish_processed(&command.command_id);
-                continue;
-            }
-
+            consumed = true;
             if let Some(command) = self.dispatch_pending_command(
                 hub_device_id,
                 jwt,
                 radio_memory_gate,
                 command,
-                &mut dispatch_motor,
+                &mut |_| dispatch_result.clone(),
             ) {
                 remaining.push(command);
             }
